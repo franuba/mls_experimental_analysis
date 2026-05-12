@@ -4,7 +4,7 @@
 //! [`StagedPublicGroupDiff`] and associated functions and types.
 use std::collections::HashSet;
 
-use cpu_time::ThreadTime;
+use mls_profiling::track_cpu;
 use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::types::Ciphersuite;
 use serde::{Deserialize, Serialize};
@@ -130,7 +130,7 @@ impl<'a> PublicGroupDiff<'a> {
         sender_leaf_index: LeafNodeIndex,
         update_path: &[UpdatePathNode],
         exclusion_list: &HashSet<&LeafNodeIndex>,
-    ) -> Result<(Vec<EncryptionKeyPair>, CommitSecret, u128, u128), ApplyUpdatePathError> {
+    ) -> Result<(Vec<EncryptionKeyPair>, CommitSecret), ApplyUpdatePathError> {
         let params = DecryptPathParams {
             update_path,
             sender_leaf_index,
@@ -141,17 +141,19 @@ impl<'a> PublicGroupDiff<'a> {
                 .map_err(LibraryError::missing_bound_check)?,
         };
 
-        let now = ThreadTime::now();
+       let (path_position, common_path) = {
+            track_cpu!("tree");
+        
+            let path_position = self.diff
+                .subtree_root_position(params.sender_leaf_index, own_leaf_index)
+                .map_err(|_| LibraryError::custom("Expected own leaf to be in the tree"))?;
+            let common_path: Vec<crate::binary_tree::array_representation::ParentNodeIndex> =
+                self.diff.filtered_common_direct_path(own_leaf_index, params.sender_leaf_index);
 
-        let path_position = self.diff
-            .subtree_root_position(params.sender_leaf_index, own_leaf_index)
-            .map_err(|_| LibraryError::custom("Expected own leaf to be in the tree"))?;
-        let common_path: Vec<crate::binary_tree::array_representation::ParentNodeIndex> =
-            self.diff.filtered_common_direct_path(own_leaf_index, params.sender_leaf_index);
-        let path_time = now.elapsed().as_micros();
-            
-        let now = ThreadTime::now();
-        let result = self.diff.decrypt_path(
+            (path_position, common_path)
+        };
+
+        self.diff.decrypt_path(
             crypto,
             self.group_context().ciphersuite(),
             params,
@@ -159,10 +161,7 @@ impl<'a> PublicGroupDiff<'a> {
             own_leaf_index,
             common_path,
             path_position
-        )?;
-
-        let decrypt_path_time = now.elapsed().as_micros();
-        Ok((result.0, result.1, path_time, decrypt_path_time))
+        )
     }
 
     /// Return a reference to the leaf with the given index.

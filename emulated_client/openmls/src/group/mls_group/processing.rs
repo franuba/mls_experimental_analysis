@@ -2,7 +2,7 @@
 
 use std::mem;
 
-use cpu_time::ThreadTime;
+use mls_profiling::track_cpu;
 use errors::{CommitToPendingProposalsError, MergePendingCommitError};
 use openmls_traits::{crypto::OpenMlsCrypto, signatures::Signer, storage::StorageProvider as _};
 
@@ -30,8 +30,8 @@ impl MlsGroup {
         &mut self,
         provider: &Provider,
         message: impl Into<ProtocolMessage>,
-    ) -> Result<(ProcessedMessage, Option<ProcessCryptoTime>), ProcessMessageError> {
-        let now_total = ThreadTime::now();
+    ) -> Result<ProcessedMessage, ProcessMessageError> {
+        track_cpu!("total");
 
         // Make sure we are still a member of the group
         if !self.is_active() {
@@ -58,23 +58,23 @@ impl MlsGroup {
             self.configuration().sender_ratchet_configuration().clone();
 
 
-        let now = ThreadTime::now();
-        // Checks the following semantic validation:
-        //  - ValSem002
-        //  - ValSem003
-        //  - ValSem006
-        //  - ValSem007 MembershipTag presence
-        let decrypted_message =
-            self.decrypt_message(provider.crypto(), message, &sender_ratchet_configuration)?;
-        
-        let decrypt_time  = now.elapsed().as_micros();
+        let decrypted_message ={
 
-        let now = ThreadTime::now();
-        let unverified_message = self
-            .public_group
-            .parse_message(decrypted_message, &self.message_secrets_store)
-            .map_err(ProcessMessageError::from)?;
-        let parse_time = now.elapsed().as_micros();
+            // Checks the following semantic validation:
+            //  - ValSem002
+            //  - ValSem003
+            //  - ValSem006
+            //  - ValSem007 MembershipTag presence
+                self.decrypt_message(provider.crypto(), message, &sender_ratchet_configuration)?
+        };
+
+        let unverified_message = {
+            track_cpu!("validation");
+            self
+                .public_group
+                .parse_message(decrypted_message, &self.message_secrets_store)
+                .map_err(ProcessMessageError::from)?
+        };
 
         // If this is a commit, we need to load the private key material we need for decryption.
         let (old_epoch_keypairs, leaf_node_keypairs) =
@@ -84,24 +84,12 @@ impl MlsGroup {
                 (vec![], vec![])
             };
 
-        let mut result = self.process_unverified_message(
+        self.process_unverified_message(
             provider,
             unverified_message,
             old_epoch_keypairs,
             leaf_node_keypairs,
-        );
-
-        let total_time = now_total.elapsed().as_micros();
-
-        if let Ok((_, time)) = &mut result {
-            if let Some(t) = time.as_mut() {
-                t.decrypt = decrypt_time;
-                t.total = total_time;
-                t.validation += parse_time;
-            }
-        }
-
-        result
+        )
     }
 
     /// Stores a standalone proposal in the internal [ProposalStore]
@@ -164,24 +152,24 @@ impl MlsGroup {
         &mut self,
         provider: &Provider,
         staged_commit: StagedCommit,
-    ) -> Result<MergeTime, MergeCommitError<Provider::StorageError>> {
-        let now_total = ThreadTime::now();
+    ) -> Result<(), MergeCommitError<Provider::StorageError>> {
+        track_cpu!("merge_total");
         
         // Check if we were removed from the group
         if staged_commit.self_removed() {
             self.group_state = MlsGroupState::Inactive;
         }
-        let now = ThreadTime::now();
-        provider
-            .storage()
-            .write_group_state(self.group_id(), &self.group_state)
-            .map_err(MergeCommitError::StorageError)?;
-        let storage_time = now.elapsed().as_micros();
 
+        {
+            track_cpu!("merge_storage");
+        
+            provider
+                .storage()
+                .write_group_state(self.group_id(), &self.group_state)
+                .map_err(MergeCommitError::StorageError)?;
+        }
         // Merge staged commit
-        let mut merge_time = self.merge_commit(provider, staged_commit)?;
-
-        merge_time.storage += storage_time;
+        self.merge_commit(provider, staged_commit)?;
 
         // Extract and store the resumption psk for the current epoch
         let resumption_psk = self.group_epoch_secrets().resumption_psk();
@@ -203,10 +191,7 @@ impl MlsGroup {
         self.clear_pending_commit(provider.storage())
             .map_err(MergeCommitError::StorageError)?;
 
-        let total_time = now_total.elapsed().as_micros();
-
-        merge_time.total = total_time;
-        Ok(merge_time)
+        Ok(())
 
     }
 
@@ -215,19 +200,19 @@ impl MlsGroup {
     pub fn merge_pending_commit<Provider: OpenMlsProvider>(
         &mut self,
         provider: &Provider,
-    ) -> Result<Option<MergeTime>, MergePendingCommitError<Provider::StorageError>> {
+    ) -> Result<(), MergePendingCommitError<Provider::StorageError>> {
         match &self.group_state {
             MlsGroupState::PendingCommit(_) => {
                 let old_state = mem::replace(&mut self.group_state, MlsGroupState::Operational);
                 if let MlsGroupState::PendingCommit(pending_commit_state) = old_state {
-                    Ok(Some(self.merge_staged_commit(provider, (*pending_commit_state).into())?))
+                    Ok(self.merge_staged_commit(provider, (*pending_commit_state).into())?)
                 }
                 else {
-                    Ok(None)
+                    Ok(())
                 }
             }
             MlsGroupState::Inactive => Err(MlsGroupStateError::UseAfterEviction)?,
-            MlsGroupState::Operational => Ok(None),
+            MlsGroupState::Operational => Ok(()),
         }
     }
 
@@ -291,20 +276,17 @@ impl MlsGroup {
         unverified_message: UnverifiedMessage,
         old_epoch_keypairs: Vec<EncryptionKeyPair>,
         leaf_node_keypairs: Vec<EncryptionKeyPair>,
-    ) -> Result<(ProcessedMessage, Option<ProcessCryptoTime>), ProcessMessageError> {
+    ) -> Result<ProcessedMessage, ProcessMessageError> {
 
-        let mut process_time = ProcessCryptoTime::default();
-
-        let now = ThreadTime::now();
-        // Checks the following semantic validation:
-        //  - ValSem010
-        //  - ValSem246 (as part of ValSem010)
-        //  - https://validation.openmls.tech/#valn1302
-        //  - https://validation.openmls.tech/#valn1304
-        let (content, credential) =
-            unverified_message.verify(self.ciphersuite(), provider.crypto(), self.version())?;
-
-        let verify_time = now.elapsed().as_micros();
+        let (content,credential) = {
+            track_cpu!("verify");
+            // Checks the following semantic validation:
+            //  - ValSem010
+            //  - ValSem246 (as part of ValSem010)
+            //  - https://validation.openmls.tech/#valn1302
+            //  - https://validation.openmls.tech/#valn1304
+            unverified_message.verify(self.ciphersuite(), provider.crypto(), self.version())?
+        };
 
         match content.sender() {
             Sender::Member(_) | Sender::NewMemberCommit | Sender::NewMemberProposal => {
@@ -332,31 +314,25 @@ impl MlsGroup {
                         }
                     }
                     FramedContentBody::Commit(_) => {
-                        let (staged_commit, time) = self.stage_commit(
+                        let staged_commit = self.stage_commit(
                             &content,
                             old_epoch_keypairs,
                             leaf_node_keypairs,
                             provider,
                         )?;
 
-                        if let Some(time) = time {
-                            process_time = time;
-                        }
                         ProcessedMessageContent::StagedCommitMessage(Box::new(staged_commit))
                     }
                 };
 
-
-                process_time.verify = verify_time;
-
-                Ok((ProcessedMessage::new(
+                Ok(ProcessedMessage::new(
                     self.group_id().clone(),
                     epoch,
                     sender,
                     authenticated_data,
                     content,
                     credential,
-                ), Some(process_time)))
+                ))
             }
             Sender::External(_) => {
                 let sender = content.sender().clone();
@@ -373,14 +349,14 @@ impl MlsGroup {
                                 content,
                             )?,
                         ));
-                        Ok((ProcessedMessage::new(
+                        Ok(ProcessedMessage::new(
                             self.group_id().clone(),
                             self.context().epoch(),
                             sender,
                             data,
                             content,
                             credential,
-                        ), None))
+                        ))
                     }
                     // TODO #151/#106
                     FramedContentBody::Proposal(_) => {

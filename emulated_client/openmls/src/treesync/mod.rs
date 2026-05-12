@@ -374,6 +374,8 @@ pub(crate) struct TreeSync {
     tree: MlsBinaryTree<TreeSyncLeafNode, TreeSyncParentNode>,
     tree_hash: Vec<u8>,
     tree_hashes: Vec<Vec<u8>>,
+    blanked_leaves: Vec<LeafNodeIndex>,
+    num_members: usize,
 }
 
 impl TreeSync {
@@ -415,11 +417,14 @@ impl TreeSync {
             tree,
             tree_hash: vec![],
             tree_hashes: vec![],
+            blanked_leaves: vec![],
+            num_members: 0,
         };
 
         tree_sync.populate_tree_hashes(provider.crypto(), ciphersuite)?;
         // Populate tree hash caches.
         tree_sync.populate_parent_hashes(provider.crypto(), ciphersuite)?;
+        tree_sync.calculate_num_members();
 
         Ok((tree_sync, commit_secret, encryption_key_pair))
     }
@@ -429,12 +434,18 @@ impl TreeSync {
         self.tree_hash.as_slice()
     }
 
+    pub(crate) fn num_members(&self) -> usize {
+        self.num_members
+    }
+
     /// Merge the given diff into this `TreeSync` instance, refreshing the
     /// `tree_hash` value in the process.
     pub(crate) fn merge_diff(&mut self, tree_sync_diff: StagedTreeSyncDiff) {
-        let (diff, new_tree_hash, new_tree_hashes) = tree_sync_diff.into_parts();
+        let (diff, new_tree_hash, new_tree_hashes, blanked_leaves, num_members) = tree_sync_diff.into_parts();
         self.tree_hash = new_tree_hash;
         self.tree_hashes = new_tree_hashes;
+        self.blanked_leaves = blanked_leaves;
+        self.num_members = num_members;
         self.tree.merge_diff(diff);
     }
 
@@ -472,13 +483,19 @@ impl TreeSync {
         }
 
         let tree = MlsBinaryTree::new(ts_nodes).map_err(|_| PublicTreeError::MalformedTree)?;
+
+        
         let mut tree_sync = Self {
             tree,
             tree_hash: vec![],
             tree_hashes: vec![],
+            blanked_leaves: vec![],
+            num_members: 0,
         };
 
         tree_sync.populate_tree_hashes(crypto, ciphersuite)?;
+        tree_sync.calculate_num_members();
+        tree_sync.calculate_blanked_leaves();
 
         // Verify all parent hashes.
         tree_sync
@@ -566,6 +583,26 @@ impl TreeSync {
         diff.verify_parent_hashes(crypto, ciphersuite)
     }
 
+    pub(crate) fn calculate_blanked_leaves(&mut self) {
+        let rightmost_full_leaf = self.rightmost_full_leaf_complete();
+        self.blanked_leaves = self
+            .tree
+            .leaves()
+            .take_while(|(leaf_index, _)| *leaf_index < rightmost_full_leaf)
+            .filter_map(|(leaf_index, leaf)| {
+                if leaf.node().as_ref().is_none() {
+                    Some(leaf_index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+    }
+
+    pub(crate) fn calculate_num_members(&mut self) {
+        self.num_members = self.full_leaves().count();
+    }
+
     /// Returns the tree size
     pub(crate) fn tree_size(&self) -> TreeSize {
         self.tree.tree_size()
@@ -587,6 +624,12 @@ impl TreeSync {
 
     /// Returns the index of the last full leaf in the tree.
     fn rightmost_full_leaf(&self) -> LeafNodeIndex {
+        let index = LeafNodeIndex::new((self.num_members + self.blanked_leaves.len() - 1) as u32);
+        index
+    }
+
+    /// Returns the index of the last full leaf in the tree.
+    fn rightmost_full_leaf_complete(&self) -> LeafNodeIndex {
         let mut index = LeafNodeIndex::new(0);
         for (leaf_index, leaf) in self.tree.leaves() {
             if leaf.node().as_ref().is_some() {
@@ -595,6 +638,7 @@ impl TreeSync {
         }
         index
     }
+
 
     /// Returns a list of [`Member`]s containing only full nodes.
     ///
@@ -637,7 +681,7 @@ impl TreeSync {
         let mut nodes = Vec::new();
 
         // Determine the index of the rightmost full leaf.
-        let max_length = self.rightmost_full_leaf();
+        let max_length = self.rightmost_full_leaf_complete();
 
         // We take all the leaves including the rightmost full leaf, blank
         // leaves beyond that are trimmed.

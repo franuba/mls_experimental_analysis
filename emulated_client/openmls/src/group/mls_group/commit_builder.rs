@@ -5,6 +5,7 @@ use openmls_traits::{
     crypto::OpenMlsCrypto, random::OpenMlsRand, signatures::Signer, storage::StorageProvider as _,
 };
 use tls_codec::Serialize as _;
+use mls_profiling::track_cpu;
 
 use crate::{
     binary_tree::LeafNodeIndex,
@@ -33,10 +34,8 @@ use super::{
     staged_commit::{MemberStagedCommitState, StagedCommitState},
     AddProposal, CreateCommitResult, GroupContextExtensionProposal, MlsGroup, MlsGroupState,
     MlsMessageOut, PendingCommitState, Proposal, RemoveProposal, Sender,
-    CryptoTime
 };
 
-use cpu_time::ThreadTime;
 
 /// This stage is for populating the builder.
 pub struct Initial {
@@ -275,16 +274,6 @@ impl<'a> CommitBuilder<'a, LoadedPsks> {
         signer: &impl Signer,
         f: impl FnMut(&QueuedProposal) -> bool,
     ) -> Result<CommitBuilder<'a, Complete>, CreateCommitError> {
-        self.build_internal(rand, crypto, signer, f).map(|(builder, _)| {builder})
-    }
-
-    pub fn build_deep(
-        self,
-        rand: &impl OpenMlsRand,
-        crypto: &impl OpenMlsCrypto,
-        signer: &impl Signer,
-        f: impl FnMut(&QueuedProposal) -> bool,
-    ) -> Result<(CommitBuilder<'a, Complete>, CryptoTime), CreateCommitError> {
         self.build_internal(rand, crypto, signer, f)
     }
 
@@ -294,8 +283,8 @@ impl<'a> CommitBuilder<'a, LoadedPsks> {
         crypto: &impl OpenMlsCrypto,
         signer: &impl Signer,
         f: impl FnMut(&QueuedProposal) -> bool,
-    ) -> Result<(CommitBuilder<'a, Complete>, CryptoTime), CreateCommitError> {
-        let now_total = ThreadTime::now();
+    ) -> Result<CommitBuilder<'a, Complete>, CreateCommitError> {
+        track_cpu!("total");
 
         let ciphersuite = self.group.ciphersuite();
         let sender = Sender::build_member(self.group.own_leaf_index());
@@ -339,79 +328,82 @@ impl<'a> CommitBuilder<'a, LoadedPsks> {
             })?;
         // Validate the proposals by doing the following checks:
         
-        let now = ThreadTime::now();
-        // ValSem113: All Proposals: The proposal type must be supported by all
-        // members of the group
-        builder
-            .group
-            .public_group
-            .validate_proposal_type_support(&proposal_queue)?;
-        // ValSem101
-        // ValSem102
-        // ValSem103
-        // ValSem104
+        {
+            track_cpu!("validation");
+            
+            // ValSem113: All Proposals: The proposal type must be supported by all
+            // members of the group
+            builder
+                .group
+                .public_group
+                .validate_proposal_type_support(&proposal_queue)?;
+            // ValSem101
+            // ValSem102
+            // ValSem103
+            // ValSem104
 
-        builder
-            .group
-            .public_group
-            .validate_key_uniqueness(&proposal_queue, None)?;
-        // ValSem105
-        builder
-            .group
-            .public_group
-            .validate_add_proposals(&proposal_queue)?;
-        // ValSem106
-        // ValSem109
-        builder
-            .group
-            .public_group
-            .validate_capabilities(&proposal_queue)?;
-        // ValSem107
-        // ValSem108
-        builder
-            .group
-            .public_group
-            .validate_remove_proposals(&proposal_queue)?;
-        builder
-            .group
-            .public_group
-            .validate_pre_shared_key_proposals(&proposal_queue)?;
-        // Validate update proposals for member commits
-        // ValSem110
-        // ValSem111
-        // ValSem112
-        builder
-            .group
-            .public_group
-            .validate_update_proposals(&proposal_queue, builder.group.own_leaf_index())?;
+            builder
+                .group
+                .public_group
+                .validate_key_uniqueness(&proposal_queue, None)?;
+            // ValSem105
+            builder
+                .group
+                .public_group
+                .validate_add_proposals(&proposal_queue)?;
+            // ValSem106
+            // ValSem109
+            builder
+                .group
+                .public_group
+                .validate_capabilities(&proposal_queue)?;
+            // ValSem107
+            // ValSem108
+            builder
+                .group
+                .public_group
+                .validate_remove_proposals(&proposal_queue)?;
+            builder
+                .group
+                .public_group
+                .validate_pre_shared_key_proposals(&proposal_queue)?;
+            // Validate update proposals for member commits
+            // ValSem110
+            // ValSem111
+            // ValSem112
+            builder
+                .group
+                .public_group
+                .validate_update_proposals(&proposal_queue, builder.group.own_leaf_index())?;
 
-        // ValSem208
-        // ValSem209
-        builder
-            .group
-            .public_group
-            .validate_group_context_extensions_proposal(&proposal_queue)?;
-
-        let validation_time = now.elapsed().as_micros();
+            // ValSem208
+            // ValSem209
+            builder
+                .group
+                .public_group
+                .validate_group_context_extensions_proposal(&proposal_queue)?;
+        }
 
         let ciphersuite = builder.group.ciphersuite();
         let sender = Sender::build_member(builder.group.own_leaf_index());
         let proposal_reference_list = proposal_queue.commit_list();
-
-        let now = ThreadTime::now();
         // Make a copy of the public group to apply proposals safely
         let mut diff = builder.group.public_group.empty_diff();
 
-        // Apply proposals to tree
-        let apply_proposals_values =
-            diff.apply_proposals(&proposal_queue, builder.group.own_leaf_index())?;
-        if apply_proposals_values.self_removed {
-            return Err(CreateCommitError::CannotRemoveSelf);
-        }
+        let apply_proposals_values = {
+            track_cpu!("apply_proposals");
 
-        let apply_proposals_time = now.elapsed().as_micros();
 
-        let (path_computation_result, tree_time, encrypt_path_time) =
+            // Apply proposals to tree
+            let apply_proposals_values =
+                diff.apply_proposals(&proposal_queue, builder.group.own_leaf_index())?;
+            if apply_proposals_values.self_removed {
+                return Err(CreateCommitError::CannotRemoveSelf);
+            }
+            apply_proposals_values
+        };
+
+        let path_computation_result = {
             // If path is needed, compute path values
             if apply_proposals_values.path_required
                 || contains_own_updates
@@ -435,9 +427,10 @@ impl<'a> CommitBuilder<'a, LoadedPsks> {
                 // If path is not needed, update the group context and return
                 // empty path processing results
                 diff.update_group_context(apply_proposals_values.extensions.clone())?;
-                (PathComputationResult::default(), 0, 0)
-            };
-
+                PathComputationResult::default()
+            }
+        };
+            
         let update_path_leaf_node = path_computation_result
             .encrypted_path
             .as_ref()
@@ -449,75 +442,73 @@ impl<'a> CommitBuilder<'a, LoadedPsks> {
             path: path_computation_result.encrypted_path,
         };
 
-        let now = ThreadTime::now();
+        let mut authenticated_content = {
+            track_cpu!("sign");
 
-        // Build AuthenticatedContent
-        let mut authenticated_content = AuthenticatedContent::commit(
-            builder.group.framing_parameters(),
-            sender,
-            commit,
-            builder.group.public_group.group_context(),
-            signer,
-        )?;
+            // Build AuthenticatedContent
+            AuthenticatedContent::commit(
+                builder.group.framing_parameters(),
+                sender,
+                commit,
+                builder.group.public_group.group_context(),
+                signer,
+            )?
+        };
 
-        let sign_time = now.elapsed().as_micros();
+        let (joiner_secret, welcome_secret, provisional_epoch_secrets, confirmation_tag,
+        serialized_provisional_group_context) = {
+            track_cpu!("schedule");
+            // Update the confirmed transcript hash using the commit we just created.
+            diff.update_confirmed_transcript_hash(crypto, &authenticated_content)?;
 
-        let now = ThreadTime::now();
+            let serialized_provisional_group_context = diff
+                .group_context()
+                .tls_serialize_detached()
+                .map_err(LibraryError::missing_bound_check)?;
 
-        // Update the confirmed transcript hash using the commit we just created.
-        diff.update_confirmed_transcript_hash(crypto, &authenticated_content)?;
-
-        let serialized_provisional_group_context = diff
-            .group_context()
-            .tls_serialize_detached()
-            .map_err(LibraryError::missing_bound_check)?;
-
-        let joiner_secret = JoinerSecret::new(
-            crypto,
-            ciphersuite,
-            path_computation_result.commit_secret,
-            builder.group.group_epoch_secrets().init_secret(),
-            &serialized_provisional_group_context,
-        )
-        .map_err(LibraryError::unexpected_crypto_error)?;
-
-        // Prepare the PskSecret
-        let psk_secret = { PskSecret::new(crypto, ciphersuite, psks)? };
-
-        // Create key schedule
-        let mut key_schedule = KeySchedule::init(ciphersuite, crypto, &joiner_secret, psk_secret)?;
-
-        let serialized_provisional_group_context = diff
-            .group_context()
-            .tls_serialize_detached()
-            .map_err(LibraryError::missing_bound_check)?;
-
-        let welcome_secret = key_schedule
-            .welcome(crypto, builder.group.ciphersuite())
-            .map_err(|_| LibraryError::custom("Using the key schedule in the wrong state"))?;
-        key_schedule
-            .add_context(crypto, &serialized_provisional_group_context)
-            .map_err(|_| LibraryError::custom("Using the key schedule in the wrong state"))?;
-        let provisional_epoch_secrets = key_schedule
-            .epoch_secrets(crypto, builder.group.ciphersuite())
-            .map_err(|_| LibraryError::custom("Using the key schedule in the wrong state"))?;
-
-        // Calculate the confirmation tag
-        let confirmation_tag = provisional_epoch_secrets
-            .confirmation_key()
-            .tag(
+            let joiner_secret = JoinerSecret::new(
                 crypto,
-                builder.group.ciphersuite(),
-                diff.group_context().confirmed_transcript_hash(),
+                ciphersuite,
+                path_computation_result.commit_secret,
+                builder.group.group_epoch_secrets().init_secret(),
+                &serialized_provisional_group_context,
             )
             .map_err(LibraryError::unexpected_crypto_error)?;
 
-        // Set the confirmation tag
-        authenticated_content.set_confirmation_tag(confirmation_tag.clone());
+            // Prepare the PskSecret
+            let psk_secret = { PskSecret::new(crypto, ciphersuite, psks)? };
 
-        diff.update_interim_transcript_hash(ciphersuite, crypto, confirmation_tag.clone())?;
+            // Create key schedule
+            let mut key_schedule = KeySchedule::init(ciphersuite, crypto, &joiner_secret, psk_secret)?;
 
-        let schedule_time = now.elapsed().as_micros();
+            let welcome_secret = key_schedule
+                .welcome(crypto, builder.group.ciphersuite())
+                .map_err(|_| LibraryError::custom("Using the key schedule in the wrong state"))?;
+            key_schedule
+                .add_context(crypto, &serialized_provisional_group_context)
+                .map_err(|_| LibraryError::custom("Using the key schedule in the wrong state"))?;
+            let provisional_epoch_secrets = key_schedule
+                .epoch_secrets(crypto, builder.group.ciphersuite())
+                .map_err(|_| LibraryError::custom("Using the key schedule in the wrong state"))?;
+
+            // Calculate the confirmation tag
+            let confirmation_tag = provisional_epoch_secrets
+                .confirmation_key()
+                .tag(
+                    crypto,
+                    builder.group.ciphersuite(),
+                    diff.group_context().confirmed_transcript_hash(),
+                )
+                .map_err(LibraryError::unexpected_crypto_error)?;
+
+                
+            // Set the confirmation tag
+            authenticated_content.set_confirmation_tag(confirmation_tag.clone());
+
+            diff.update_interim_transcript_hash(ciphersuite, crypto, confirmation_tag.clone())?;
+
+            (joiner_secret, welcome_secret, provisional_epoch_secrets, confirmation_tag, serialized_provisional_group_context)
+        };
 
         // If there are invitations, we need to build a welcome
         let needs_welcome = !apply_proposals_values.invitation_list.is_empty();
@@ -563,47 +554,47 @@ impl<'a> CommitBuilder<'a, LoadedPsks> {
             Some(group_info_tbs.sign(signer)?)
         };
 
-        let now = ThreadTime::now();
+        let welcome_option = {
+            track_cpu!("welcome");
 
-        let welcome_option = if !needs_welcome {
-            None
-        } else {
-            // Encrypt GroupInfo object
-            let (welcome_key, welcome_nonce) = welcome_secret
-                .derive_welcome_key_nonce(crypto, builder.group.ciphersuite())
-                .map_err(LibraryError::unexpected_crypto_error)?;
-            let encrypted_group_info = welcome_key
-                .aead_seal(
+            if !needs_welcome {
+                None
+            } else {
+                // Encrypt GroupInfo object
+                let (welcome_key, welcome_nonce) = welcome_secret
+                    .derive_welcome_key_nonce(crypto, builder.group.ciphersuite())
+                    .map_err(LibraryError::unexpected_crypto_error)?;
+                let encrypted_group_info = welcome_key
+                    .aead_seal(
+                        crypto,
+                        group_info
+                            .as_ref()
+                            .ok_or_else(|| LibraryError::custom("GroupInfo was not computed"))?
+                            .tls_serialize_detached()
+                            .map_err(LibraryError::missing_bound_check)?
+                            .as_slice(),
+                        &[],
+                        &welcome_nonce,
+                    )
+                    .map_err(LibraryError::unexpected_crypto_error)?;
+
+                // Create group secrets for later use, so we can afterwards consume the
+                // `joiner_secret`.
+                let encrypted_secrets = diff.encrypt_group_secrets(
+                    &joiner_secret,
+                    apply_proposals_values.invitation_list,
+                    path_computation_result.plain_path.as_deref(),
+                    &apply_proposals_values.presharedkeys,
+                    &encrypted_group_info,
                     crypto,
-                    group_info
-                        .as_ref()
-                        .ok_or_else(|| LibraryError::custom("GroupInfo was not computed"))?
-                        .tls_serialize_detached()
-                        .map_err(LibraryError::missing_bound_check)?
-                        .as_slice(),
-                    &[],
-                    &welcome_nonce,
-                )
-                .map_err(LibraryError::unexpected_crypto_error)?;
+                    builder.group.own_leaf_index(),
+                )?;
 
-            // Create group secrets for later use, so we can afterwards consume the
-            // `joiner_secret`.
-            let encrypted_secrets = diff.encrypt_group_secrets(
-                &joiner_secret,
-                apply_proposals_values.invitation_list,
-                path_computation_result.plain_path.as_deref(),
-                &apply_proposals_values.presharedkeys,
-                &encrypted_group_info,
-                crypto,
-                builder.group.own_leaf_index(),
-            )?;
-
-            // Create welcome message
-            let welcome = Welcome::new(ciphersuite, encrypted_secrets, encrypted_group_info);
-            Some(welcome)
+                // Create welcome message
+                let welcome = Welcome::new(ciphersuite, encrypted_secrets, encrypted_group_info);
+                Some(welcome)
+            }
         };
-
-        let welcome_time = now.elapsed().as_micros();
 
         let (provisional_group_epoch_secrets, provisional_message_secrets) =
             provisional_epoch_secrets.split_secrets(
@@ -638,8 +629,7 @@ impl<'a> CommitBuilder<'a, LoadedPsks> {
             },
         });
 
-        let total_time = now_total.elapsed().as_micros();
-        let crypto_time = CryptoTime {
+        /*let crypto_time = CryptoTime {
             total: total_time,
             validation: validation_time,
             apply_proposals: apply_proposals_time,
@@ -650,10 +640,10 @@ impl<'a> CommitBuilder<'a, LoadedPsks> {
             schedule: schedule_time,
             storage: 0,
             encrypt: 0,
-        };
+        };*/
 
 
-        Ok((result, crypto_time) )
+        Ok(result)
     }
 }
 
@@ -664,55 +654,13 @@ impl CommitBuilder<'_, Complete> {
     }
 
     /// Stages the commit and returns the protocol messages.
-    pub fn stage_commit_deep<Provider: OpenMlsProvider>(
-        self,
-        provider: &Provider,
-    ) -> Result<(CommitMessageBundle, u128, u128), CommitBuilderStageError<Provider::StorageError>> {
-        let Self {
-            group,
-            stage: Complete {
-                result: create_commit_result,
-            },
-            ..
-        } = self;
-
-        // Set the current group state to [`MlsGroupState::PendingCommit`],
-        // storing the current [`StagedCommit`] from the commit results
-        group.group_state = MlsGroupState::PendingCommit(Box::new(PendingCommitState::Member(
-            create_commit_result.staged_commit,
-        )));
-
-        let now = ThreadTime::now();
-        provider
-            .storage()
-            .write_group_state(group.group_id(), &group.group_state)
-            .map_err(CommitBuilderStageError::KeyStoreError)?;
-
-        let storage_time = now.elapsed().as_micros();
-        group.reset_aad();
-
-        let now = ThreadTime::now();
-        // Convert PublicMessage messages to MLSMessage and encrypt them if required by the
-        // configuration.
-        //
-        // Note that this performs writes to the storage, so we should do that here, rather than
-        // when working with the result.
-        let mls_message = group.content_to_mls_message(create_commit_result.commit, provider)?;
-        let encryption_time = now.elapsed().as_micros();
-
-        Ok((CommitMessageBundle {
-            version: group.version(),
-            commit: mls_message,
-            welcome: create_commit_result.welcome_option,
-            group_info: create_commit_result.group_info,
-        }, storage_time, encryption_time))
-    }
-
-    /// Stages the commit and returns the protocol messages.
     pub fn stage_commit<Provider: OpenMlsProvider>(
         self,
         provider: &Provider,
     ) -> Result<CommitMessageBundle, CommitBuilderStageError<Provider::StorageError>> {
+
+        track_cpu!("total");
+
         let Self {
             group,
             stage: Complete {
@@ -727,13 +675,17 @@ impl CommitBuilder<'_, Complete> {
             create_commit_result.staged_commit,
         )));
 
-        provider
-            .storage()
-            .write_group_state(group.group_id(), &group.group_state)
-            .map_err(CommitBuilderStageError::KeyStoreError)?;
+        {
+            track_cpu!("storage");
+            provider
+                .storage()
+                .write_group_state(group.group_id(), &group.group_state)
+                .map_err(CommitBuilderStageError::KeyStoreError)?;
 
+        }
         group.reset_aad();
 
+        
         // Convert PublicMessage messages to MLSMessage and encrypt them if required by the
         // configuration.
         //

@@ -50,7 +50,7 @@ data[x_label] = data[x_label].fillna(0).astype(int)
 
 
 # Create plot
-plt.figure(figsize=(8, 6))
+plt.figure(figsize=(8, 5))
 plt.plot(data[x_label], data['mean_latency'], label='Mean Latency', color='blue', marker='.')
 plt.plot(data[x_label], data['max_latency'], label='Max Latency', color='red', marker='.')
 

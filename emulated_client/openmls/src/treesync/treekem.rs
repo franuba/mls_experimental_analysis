@@ -5,8 +5,7 @@
 //! This module contains structs and functions to encrypt and decrypt path
 //! updates for a [`TreeSyncDiff`] instance.
 use std::collections::HashSet;
-
-use cpu_time::ThreadTime;
+use mls_profiling::track_cpu;
 use openmls_traits::{
     crypto::OpenMlsCrypto,
     types::{Ciphersuite, HpkeCiphertext},
@@ -32,7 +31,6 @@ use crate::{
     error::LibraryError,
     messages::{proposals::AddProposal, EncryptedGroupSecrets, GroupSecrets, PathSecret},
     schedule::{psk::PreSharedKeyId, CommitSecret, JoinerSecret},
-    treesync::node::NodeReference,
 };
 
 impl TreeSyncDiff<'_> {
@@ -57,7 +55,6 @@ impl TreeSyncDiff<'_> {
         let resolved_path = path.par_iter().zip(copath_resolutions.par_iter());
         #[cfg(target_arch = "wasm32")]
         let resolved_path = path.iter().zip(copath_resolutions.iter());
-
         resolved_path
             .map(|(node, resolution)| node.encrypt(crypto, ciphersuite, resolution, group_context))
             .collect::<Result<Vec<UpdatePathNode>, LibraryError>>()
@@ -93,7 +90,9 @@ impl TreeSyncDiff<'_> {
             .ok_or_else(|| LibraryError::custom("Expected to find ciphertext in update path 1"))?;
 
 
-        let (decryption_key, resolution_position) = self
+        let (decryption_key, resolution_position) = {
+            track_cpu!("tree");
+            self
             .decryption_key(
                 params.sender_leaf_index,
                 params.exclusion_list,
@@ -101,7 +100,8 @@ impl TreeSyncDiff<'_> {
                 own_leaf_index,
             )
             // TODO #804
-            .map_err(|_| LibraryError::custom("Expected sender to be in the tree"))?;
+            .map_err(|_| LibraryError::custom("Expected sender to be in the tree"))?
+        };
 
         let ciphertext = update_path_node
             .encrypted_path_secrets(resolution_position)
@@ -110,17 +110,22 @@ impl TreeSyncDiff<'_> {
             .ok_or_else(|| LibraryError::custom("Expected to find ciphertext in update path 2"))?;
 
         // ValSem203: Path secrets must decrypt correctly
-        let path_secret = PathSecret::decrypt(
-            crypto,
-            ciphersuite,
-            ciphertext,
-            decryption_key,
-            params.group_context,
-        )
-        .map_err(|_| ApplyUpdatePathError::UnableToDecrypt)?;
+        let path_secret = {
+            track_cpu!("decrypt_path");
+            PathSecret::decrypt(
+                crypto,
+                ciphersuite,
+                ciphertext,
+                decryption_key,
+                params.group_context,
+            )
+            .map_err(|_| ApplyUpdatePathError::UnableToDecrypt)?
+        };
     
-        let (derived_path, _plain_update_path, keypairs, commit_secret) =
-            ParentNode::derive_path(crypto, ciphersuite, path_secret, common_path)?;
+        let (derived_path, _plain_update_path, keypairs, commit_secret) = {
+            track_cpu!("path");
+            ParentNode::derive_path(crypto, ciphersuite, path_secret, common_path)?
+        };
         // We now check that the public keys in the update path and in the
         // derived path match up.
         // ValSem204: Public keys from Path must be verified and match the private keys from the direct path

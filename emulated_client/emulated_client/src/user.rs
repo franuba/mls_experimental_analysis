@@ -10,9 +10,9 @@ use chrono::prelude::*;
 use cpu_time::ThreadTime;
 use futures::executor::block_on;
 use ds_lib::{ClientKeyPackages, GroupInfoAndTree, GroupMessage, WelcomeAcknowledgement};
+use mls_profiling::track_cpu;
 use openmls::prelude::*;
 use rand::Rng;
-use std::time::Duration;
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -539,6 +539,9 @@ impl<P: OpenMlsProvider> User<P> {
     fn process_protocol_message(&mut self, message: ProtocolMessage, sender: String)
                                     -> Result<(Option<ActionRecord>, PostUpdateActions, Option<GroupId>), String>
     {
+        // Reset Profiler
+        let _prof = mls_profiling::start_iteration();
+        
         let group_name = from_utf8(message.group_id().as_slice()).unwrap();
         let mut groups = self.groups.borrow_mut();
 
@@ -599,10 +602,10 @@ impl<P: OpenMlsProvider> User<P> {
 
         let now = ThreadTime::now();
 
-        let (processed_message, time) = {
+        let processed_message = {
             let mut mls_group = group.mls_group.borrow_mut();
-            let (processed_message, time) = match mls_group.process_message(&self.crypto, message.clone()) {
-                Ok((msg, time)) => {(msg, time)},
+            let processed_message = match mls_group.process_message(&self.crypto, message.clone()) {
+                Ok(msg) => {msg},
                 Err(e) => {
                     // Conflict
                     if ProcessMessageError::ValidationError(ValidationError::WrongEpoch) == e
@@ -629,7 +632,7 @@ impl<P: OpenMlsProvider> User<P> {
                 }
             };
 
-            (processed_message, time)
+            processed_message
         };
 
         let processed_message_credential: Credential = processed_message.credential().clone();
@@ -691,12 +694,11 @@ impl<P: OpenMlsProvider> User<P> {
                     remove_proposal = true;
                 }
 
-                let merge_time = mls_group.merge_staged_commit(&self.crypto, commit)
+                mls_group.merge_staged_commit(&self.crypto, commit)
                     .map_err(|e| format!("Error merging commit: {:?}", e))?;
 
                 // Stop counting time
                 let elapsed = now.elapsed().as_micros();
-                
 
                 let next_action = match self.agent_type {
                     AgentType::Independent => {
@@ -749,9 +751,32 @@ impl<P: OpenMlsProvider> User<P> {
                         Some(mls_group.group_id().clone()),
                     ));
                 }
+
+                let prof = mls_profiling::start_iteration();
+                //tracing::info!("IN PROCESS: {:?}", prof);
+
+                let process_time = ProcessCryptoTime {
+                    total: prof.get("total"),
+                    decrypt: prof.get("decrypt"),
+                    verify: prof.get("verify"),
+                    validation: prof.get("validation"),
+                    apply_proposals: prof.get("apply_proposals"),
+                    tree: prof.get("tree"),
+                    path: prof.get("path"),
+                    tree_hash: prof.get("tree_hash"),
+                    parent_hash: prof.get("parent_hash"),
+                    decrypt_path: prof.get("decrypt_path"),
+                    schedule: prof.get("schedule"),
+                };
                 
+                let merge_time = MergeTime {
+                    total: prof.get("merge_total"),
+                    storage: prof.get("merge_storage"),
+                    merge: prof.get("merge"),
+                };
+
                 //let result = CGKAAction::Process(sender.clone());
-                let result = CGKAAction::DeepProcess(sender.clone(), time.unwrap_or_default(), merge_time);
+                let result = CGKAAction::DeepProcess(sender.clone(), process_time, merge_time);
 
                 let members = mls_group.members().count();
                 tracing::info!("PROCESSED COMMIT from {} IN {}. Epoch: {}. Members: {})", sender_name, group.group_name,
@@ -1060,6 +1085,8 @@ impl<P: OpenMlsProvider> User<P> {
 
     /// Invite user with the given name to the group.
     pub fn invite(&mut self, name: String, group_name: String) -> Result<EpochChange, String> {
+        // Reset Profiler
+        let _prof = mls_profiling::start_iteration();
 
         // First we need to get the key package for {id} from the DS.
         let contact = match self.contacts.values().find(|c| c.username == name) {
@@ -1071,17 +1098,18 @@ impl<P: OpenMlsProvider> User<P> {
 
         let now = ThreadTime::now();
         // Build a proposal with this key package and do the MLS bits.
-        let (out_messages, welcome, new_group_info, crypto_time) = {
+        let (out_messages, welcome, new_group_info) = {
             let mut groups = self.groups.borrow_mut();
             let group = match groups.get_mut(&group_name) {
                 Some(g) => g,
                 None => return Err(format!("No group with name {group_name} known.")),
             };
 
+            
             let result = black_box(group
                 .mls_group
                 .borrow_mut()
-                .add_members_deep(
+                .add_members(
                 //.add_members(
                     &self.crypto,
                     &self.identity.borrow().signer,
@@ -1089,32 +1117,53 @@ impl<P: OpenMlsProvider> User<P> {
                 )
                 .map_err(|e| format!("Failed to add member to group - {e}"))?);
 
-
             result
         };
 
         let mut elapsed = now.elapsed().as_micros();
 
-        let (export_time, merge_time) = {
+        {
             let mut groups = self.groups.borrow_mut();
             let group = match groups.get_mut(&group_name) {
                 Some(g) => g,
                 None => return Err(format!("No group with name {group_name} known.")),
             };
 
-            let now = ThreadTime::now();
-            let _tree = black_box(group.mls_group.borrow().export_ratchet_tree());
-            let export_time = now.elapsed().as_micros();
-
-            let merge_time = group.mls_group.borrow_mut().merge_pending_commit(self.crypto())
-                .map_err(|e| format!("Error merging commit; {e}"))?;
-
-            if let Some(ref merge_time) = merge_time {
-                elapsed += merge_time.total;
+            {
+                track_cpu!("export");
+                let _tree = black_box(group.mls_group.borrow().export_ratchet_tree());
             }
-
-            (export_time, merge_time)
+        
+            group.mls_group.borrow_mut().merge_pending_commit(self.crypto())
+                .map_err(|e| format!("Error merging commit; {e}"))?;
         };
+
+        let prof = mls_profiling::start_iteration();
+        
+        let crypto_time = CryptoTime {
+            total: prof.get("total"),
+            validation: prof.get("validation"),
+            apply_proposals: prof.get("apply_proposals"),
+            tree: prof.get("tree"),
+            path: prof.get("path"),
+            tree_hash: prof.get("tree_hash"),
+            parent_hash: prof.get("parent_hash"),
+            encrypt_path: prof.get("encrypt_path"),
+            sign: prof.get("sign"),
+            schedule: prof.get("schedule"),
+            welcome: prof.get("welcome"),
+            storage: prof.get("storage"),
+            encrypt: prof.get("encrypt"),
+            export: prof.get("export"),
+        };
+        
+        let merge_time = MergeTime {
+            total: prof.get("merge_total"),
+            storage: prof.get("merge_storage"),
+            merge: prof.get("merge"),
+        };
+        elapsed += prof.get("merge_total");
+
 
         let stored_welcome = StoredWelcome {
             welcome: welcome,
@@ -1129,7 +1178,7 @@ impl<P: OpenMlsProvider> User<P> {
             new_group_info,
             Some(stored_welcome),
             //CGKAAction::Invite(name, size),
-            CGKAAction::DeepCommit(size, crypto_time, export_time, merge_time.unwrap_or_default()),
+            CGKAAction::DeepCommit(size, crypto_time, merge_time),
             elapsed
         )?;
 
@@ -1717,13 +1766,17 @@ impl<P: OpenMlsProvider> User<P> {
     }
 
     pub(crate) fn confirm_commit(&mut self, group_name: String) -> Result<(), String>{
+
+        // Reset Profiler
+        let _prof = mls_profiling::start_iteration();
+
         // Get and remove from the pending commits
         let (group_info, stored_welcome, action_record) = match self.pending_commits.remove(&group_name) {
             Some(gi) => gi,
             None => return Ok(()),
         };
 
-        let merge_time = {
+        {
             let groups = self.groups.get_mut();
             let group = match groups.get_mut(&group_name) {
                 Some(g) => g,
@@ -1734,9 +1787,8 @@ impl<P: OpenMlsProvider> User<P> {
             
             mls_group
                 .merge_pending_commit(&self.crypto)
-                .expect("error merging pending commit")
-            
-        };
+                .expect("error merging pending commit");   
+        }
 
         let ratchet_tree = {
             let groups = self.groups.borrow();
@@ -1839,11 +1891,9 @@ impl<P: OpenMlsProvider> User<P> {
                     }
                 };
 
-                let additional_commit_time = if let Some(merge_time) = merge_time {
-                    merge_time.total
-                } else {
-                    0
-                };
+                let prof = mls_profiling::start_iteration();
+                //tracing::info!("IN CONFIRM: {:?}", prof);
+                let additional_commit_time = prof.get("merge_total");
 
                 // "Epoch" and "num_users" were calculated while the commit was pending
                 ActionRecord {

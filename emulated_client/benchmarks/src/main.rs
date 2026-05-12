@@ -34,7 +34,7 @@ fn message_out_to_in(mls_message_out: MlsMessageOut) -> MlsMessageIn {
 fn process_protocol_message(crypto: &impl OpenMlsProvider, group: &mut MlsGroup, message: MlsMessageIn, merge: bool)
 {
     let message = message.try_into_protocol_message().unwrap();
-    let (processed_message, _) = group.process_message(crypto, message.clone()).unwrap();
+    let processed_message = group.process_message(crypto, message.clone()).unwrap();
 
     match processed_message.into_content() {
 

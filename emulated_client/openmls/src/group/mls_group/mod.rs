@@ -4,6 +4,7 @@
 //!
 
 use create_commit::CreateCommitParams;
+use mls_profiling::track_cpu;
 use past_secrets::MessageSecretsStore;
 use proposal_store::ProposalQueue;
 use serde::{Deserialize, Serialize};
@@ -80,12 +81,16 @@ pub struct CryptoTime {
     pub validation: u128,
     pub apply_proposals: u128,
     pub tree: u128,
+    pub path: u128,
+    pub tree_hash: u128,
+    pub parent_hash: u128,
     pub encrypt_path: u128,
     pub sign: u128,
     pub schedule: u128,
     pub welcome: u128,
     pub storage: u128,
     pub encrypt: u128,
+    pub export: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -96,6 +101,9 @@ pub struct ProcessCryptoTime {
     pub validation: u128,
     pub apply_proposals: u128,
     pub tree: u128,
+    pub path: u128,
+    pub tree_hash: u128,
+    pub parent_hash: u128,
     pub decrypt_path: u128,
     pub schedule: u128,
 }
@@ -645,11 +653,13 @@ impl MlsGroup {
             padding_size,
         )?;
 
-        provider
-            .storage()
-            .write_message_secrets(self.group_id(), &self.message_secrets_store)
-            .map_err(MessageEncryptionError::StorageError)?;
-
+        {
+            track_cpu!("storage");
+            provider
+                .storage()
+                .write_message_secrets(self.group_id(), &self.message_secrets_store)
+                .map_err(MessageEncryptionError::StorageError)?;
+        }
         Ok(msg)
     }
 
