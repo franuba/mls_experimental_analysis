@@ -101,11 +101,11 @@ def read_log_file(file):
 
                 # Compatibility with deep analysis
                 elif operation in ['DeepCommit']:
-                    group, epoch, num_users, user_id, operation, size, _bars, _, _, _, _, _, _, _, _, _bars_2, _, _, _bars_3, _, _bars_4, _, _, _, timestamp, elapsed = parts
+                    group, epoch, num_users, user_id, operation, size, _bars, _, _, _, _, _, _, _, _, _, _, _, _bars_2, _, _, _bars_3, _, _bars_4, _, _, _, timestamp, elapsed = parts
                     number_of_proposals = 1
                 # Compatibility with deep analysis
                 elif operation in ['DeepProcess']:
-                    group, epoch, num_users, user_id, operation, _bars, target_user_id, _, _, _, _, _, _, _, _, _bars_2, _, _, _, timestamp, elapsed = parts
+                    group, epoch, num_users, user_id, operation, _bars, target_user_id, _, _, _, _, _, _, _, _, _, _, _, _bars_2, _, _, _, timestamp, elapsed = parts
 
                 elif operation in ['Update']:  
                     group, epoch, num_users, user_id, operation, size, timestamp, elapsed = parts

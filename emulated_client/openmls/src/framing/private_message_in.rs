@@ -3,6 +3,7 @@ use openmls_traits::types::Ciphersuite;
 use tls_codec::{
     Deserialize, Serialize, TlsDeserialize, TlsDeserializeBytes, TlsSerialize, TlsSize,
 };
+use mls_profiling::track_cpu;
 
 use super::{
     codec::deserialize_ciphertext_content, mls_auth_content::FramedContentAuthData,
@@ -155,7 +156,9 @@ impl PrivateMessageIn {
     ) -> Result<VerifiableAuthenticatedContentIn, MessageDecryptionError> {
         let secret_type = SecretType::from(&self.content_type);
         // Extract generation and key material for encryption
-        let (ratchet_key, ratchet_nonce) = message_secrets
+        let (ratchet_key, ratchet_nonce) = {
+            track_cpu!("tree");
+            message_secrets
             .secret_tree_mut()
             .secret_for_decryption(
                 ciphersuite,
@@ -171,10 +174,14 @@ impl PrivateMessageIn {
                     sender_data.generation
                 );
                 MessageDecryptionError::SecretTreeError(e)
-            })?;
+            })?
+        };
         // Prepare the nonce by xoring with the reuse guard.
         let prepared_nonce = ratchet_nonce.xor_with_reuse_guard(&sender_data.reuse_guard);
-        let private_message_content = self.decrypt(crypto, ratchet_key, &prepared_nonce)?;
+        let private_message_content = {
+                track_cpu!("decrypt");
+                self.decrypt(crypto, ratchet_key, &prepared_nonce)?
+        };
 
         // Extract sender. The sender type is always of type Member for PrivateMessage.
         let sender = Sender::from_sender_data(sender_data);

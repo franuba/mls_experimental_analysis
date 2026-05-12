@@ -68,14 +68,6 @@ impl UserParameters {
             })
             .unwrap_or(default.behaviour);
 
-        /*let sleep_millis_min = settings.get_int("cgka.sleep_millis_min").unwrap_or(default.sleep_millis_min);
-        let sleep_millis_max = settings.get_int("cgka.sleep_millis_max").unwrap_or(default.sleep_millis_max);
-
-        let auth_policy = settings.get_string("cgka.auth_policy")
-            .map(|policy| AuthorizationPolicy::from(policy))
-            .unwrap_or(default.auth_policy);
-        let scale = settings.get_bool("cgka.scale").unwrap_or(false);*/
-
         let groups = settings.get_array("cgka.groups")
             .map(|groups| groups.iter().map(|g| g.to_string()).collect())
             .unwrap_or(default.groups);

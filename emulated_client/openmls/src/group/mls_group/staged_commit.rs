@@ -4,9 +4,7 @@ use std::mem;
 use openmls_traits::storage::StorageProvider;
 use serde::{Deserialize, Serialize};
 use tls_codec::Serialize as _;
-use cpu_time::ThreadTime;
-use super::MergeTime;
-
+use mls_profiling::track_cpu;
 use super::proposal_store::{
     QueuedAddProposal, QueuedPskProposal, QueuedRemoveProposal, QueuedUpdateProposal,
 };
@@ -14,7 +12,7 @@ use super::proposal_store::{
 use super::{
     super::errors::*, load_psks, Credential, Extension, GroupContext, GroupEpochSecrets, GroupId,
     JoinerSecret, KeySchedule, LeafNode, LibraryError, MessageSecrets, MlsGroup, OpenMlsProvider,
-    Proposal, ProposalQueue, PskSecret, QueuedProposal, Sender, ProcessCryptoTime
+    Proposal, ProposalQueue, PskSecret, QueuedProposal, Sender
 };
 use crate::{
     ciphersuite::{hash_ref::ProposalRef, Secret},
@@ -142,7 +140,7 @@ impl MlsGroup {
         old_epoch_keypairs: Vec<EncryptionKeyPair>,
         leaf_node_keypairs: Vec<EncryptionKeyPair>,
         provider: &impl OpenMlsProvider,
-    ) -> Result<(StagedCommit, Option<ProcessCryptoTime>), StageCommitError> {
+    ) -> Result<StagedCommit, StageCommitError> {
         // Check that the sender is another member of the group
         if let Sender::Member(member) = mls_content.sender() {
             if member == &self.own_leaf_index() {
@@ -152,36 +150,40 @@ impl MlsGroup {
 
         let ciphersuite = self.ciphersuite();
 
-        let now = ThreadTime::now();
-        let (commit, proposal_queue, sender_index) = self
+        let (commit, proposal_queue, sender_index) = {
+            track_cpu!("validation");
+            self
             .public_group
-            .validate_commit(mls_content, provider.crypto())?;
-
-        let validate_time = now.elapsed().as_micros();
+            .validate_commit(mls_content, provider.crypto())?
+        };
 
         // Create the provisional public group state (including the tree and
         // group context) and apply proposals.
-        let now = ThreadTime::now();
 
-        let mut diff = self.public_group.empty_diff();
-        let apply_proposals_values =
+        let (apply_proposals_values, mut diff) = {
+            track_cpu!("apply_proposals");
+
+            let mut diff = self.public_group.empty_diff();
+            let apply_proposals_values =
             diff.apply_proposals(&proposal_queue, self.own_leaf_index())?;
 
-        let apply_proposals_time = now.elapsed().as_micros();
+            (apply_proposals_values, diff)
+        };
 
         // Determine if Commit has a path
-        let (commit_secret, new_keypairs, new_leaf_keypair_option, update_path_leaf_node, tree_time, decrypt_path_time) =
+        let (commit_secret, new_keypairs, new_leaf_keypair_option, update_path_leaf_node) =
             if let Some(path) = commit.path.clone() {
-                let now = ThreadTime::now();
-                // Update the public group
-                // ValSem202: Path must be the right length
-                diff.apply_received_update_path(
-                    provider.crypto(),
-                    ciphersuite,
-                    sender_index,
-                    &path,
-                )?;
-                let mut tree_time = now.elapsed().as_micros();
+
+                {
+                    // Update the public group
+                    // ValSem202: Path must be the right length
+                    diff.apply_received_update_path(
+                        provider.crypto(),
+                        ciphersuite,
+                        sender_index,
+                        &path,
+                    )?;
+                }
 
                 // Update group context
                 diff.update_group_context(
@@ -196,11 +198,10 @@ impl MlsGroup {
                         staged_diff,
                         commit.path.as_ref().map(|path| path.leaf_node().clone()),
                     );
-                    return Ok((StagedCommit::new(
+                    return Ok(StagedCommit::new(
                         proposal_queue,
                         StagedCommitState::PublicState(Box::new(staged_state)),
-                        
-                    ), None));
+                    ));
                 }
                 let decryption_keypairs: Vec<&EncryptionKeyPair> = old_epoch_keypairs
                     .iter()
@@ -209,7 +210,7 @@ impl MlsGroup {
 
                 // ValSem203: Path secrets must decrypt correctly
                 // ValSem204: Public keys from Path must be verified and match the private keys from the direct path
-                let (new_keypairs, commit_secret, path_time, decrypt_time) = diff.decrypt_path(
+                let (new_keypairs, commit_secret) = diff.decrypt_path(
                     provider.crypto(),
                     &decryption_keypairs,
                     self.own_leaf_index(),
@@ -217,7 +218,6 @@ impl MlsGroup {
                     path.nodes(),
                     &apply_proposals_values.exclusion_list(),
                 )?;
-                tree_time += path_time;
 
                 // Check if one of our update proposals was applied. If so, we
                 // need to store that keypair separately, because after merging
@@ -249,8 +249,6 @@ impl MlsGroup {
                     new_keypairs,
                     new_leaf_keypair_option,
                     update_path_leaf_node,
-                    tree_time,
-                    decrypt_time
                 )
             } else {
                 if apply_proposals_values.path_required {
@@ -263,26 +261,29 @@ impl MlsGroup {
                     apply_proposals_values.extensions.clone(),
                 )?;
 
-                (CommitSecret::zero_secret(ciphersuite), vec![], None, None, 0, 0)
+                (CommitSecret::zero_secret(ciphersuite), vec![], None, None)
             };
 
-        let now = ThreadTime::now();
+        let (received_confirmation_tag, serialized_provisional_group_context) ={
+            track_cpu!("validation");
+            // Update the confirmed transcript hash before we compute the confirmation tag.
+            diff.update_confirmed_transcript_hash(provider.crypto(), mls_content)?;
 
-        // Update the confirmed transcript hash before we compute the confirmation tag.
-        diff.update_confirmed_transcript_hash(provider.crypto(), mls_content)?;
+            let received_confirmation_tag = mls_content
+                .confirmation_tag()
+                .ok_or(StageCommitError::ConfirmationTagMissing)?;
 
-        let received_confirmation_tag = mls_content
-            .confirmation_tag()
-            .ok_or(StageCommitError::ConfirmationTagMissing)?;
+            let serialized_provisional_group_context = diff
+                .group_context()
+                .tls_serialize_detached()
+                .map_err(LibraryError::missing_bound_check)?;
 
-        let serialized_provisional_group_context = diff
-            .group_context()
-            .tls_serialize_detached()
-            .map_err(LibraryError::missing_bound_check)?;
+            (received_confirmation_tag, serialized_provisional_group_context)
+        };
 
-        let now_schedule = ThreadTime::now();
-
-        let (provisional_group_secrets, provisional_message_secrets) = self
+        let (provisional_group_secrets, provisional_message_secrets) = {
+            track_cpu!("schedule");
+            self
             .derive_epoch_secrets(
                 provider,
                 apply_proposals_values,
@@ -294,36 +295,37 @@ impl MlsGroup {
                 serialized_provisional_group_context,
                 diff.tree_size(),
                 self.own_leaf_index(),
-            );
-
-        let schedule_time = now_schedule.elapsed().as_micros();
+            )
+        };
 
         // Verify confirmation tag
         // ValSem205
-        let own_confirmation_tag = provisional_message_secrets
-            .confirmation_key()
-            .tag(
-                provider.crypto(),
-                self.ciphersuite(),
-                diff.group_context().confirmed_transcript_hash(),
-            )
-            .map_err(LibraryError::unexpected_crypto_error)?;
-        if &own_confirmation_tag != received_confirmation_tag {
-            log::error!("Confirmation tag mismatch");
-            log_crypto!(trace, "  Got:      {:x?}", received_confirmation_tag);
-            log_crypto!(trace, "  Expected: {:x?}", own_confirmation_tag);
-            // TODO: We have tests expecting this error.
-            //       They need to be rewritten.
-            // debug_assert!(false, "Confirmation tag mismatch");
+        let own_confirmation_tag = {
+            track_cpu!("validation");
+            let own_confirmation_tag = provisional_message_secrets
+                .confirmation_key()
+                .tag(
+                    provider.crypto(),
+                    self.ciphersuite(),
+                    diff.group_context().confirmed_transcript_hash(),
+                )
+                .map_err(LibraryError::unexpected_crypto_error)?;
+            if &own_confirmation_tag != received_confirmation_tag {
+                log::error!("Confirmation tag mismatch");
+                log_crypto!(trace, "  Got:      {:x?}", received_confirmation_tag);
+                log_crypto!(trace, "  Expected: {:x?}", own_confirmation_tag);
+                // TODO: We have tests expecting this error.
+                //       They need to be rewritten.
+                // debug_assert!(false, "Confirmation tag mismatch");
 
-            // in some tests we need to be able to proceed despite the tag being wrong,
-            // e.g. to test whether a later validation check is performed correctly.
-            if !crate::skip_validation::is_disabled::confirmation_tag() {
-                return Err(StageCommitError::ConfirmationTagMismatch);
+                // in some tests we need to be able to proceed despite the tag being wrong,
+                // e.g. to test whether a later validation check is performed correctly.
+                if !crate::skip_validation::is_disabled::confirmation_tag() {
+                    return Err(StageCommitError::ConfirmationTagMismatch);
+                }
             }
-        }
-
-        let validate_time = validate_time + now.elapsed().as_micros() - schedule_time;
+            own_confirmation_tag
+        };
 
         diff.update_interim_transcript_hash(ciphersuite, provider.crypto(), own_confirmation_tag)?;
 
@@ -338,18 +340,7 @@ impl MlsGroup {
                 update_path_leaf_node,
             )));
 
-        let process_time = ProcessCryptoTime {
-            total: 0,
-            decrypt: 0,
-            verify: 0,
-            validation: validate_time,
-            apply_proposals: apply_proposals_time,
-            tree: tree_time,
-            decrypt_path: decrypt_path_time,
-            schedule: schedule_time,
-        };
-
-        Ok((StagedCommit::new(proposal_queue, staged_commit_state), Some(process_time)))
+        Ok(StagedCommit::new(proposal_queue, staged_commit_state))
     }
 
     /// Merges a [StagedCommit] into the group state and optionally return a [`SecretTree`]
@@ -361,7 +352,7 @@ impl MlsGroup {
         &mut self,
         provider: &Provider,
         staged_commit: StagedCommit,
-    ) -> Result<MergeTime, MergeCommitError<Provider::StorageError>> {
+    ) -> Result<(), MergeCommitError<Provider::StorageError>> {
         // Get all keypairs from the old epoch, so we can later store the ones
         // that are still relevant in the new epoch.
         let old_epoch_keypairs = self
@@ -371,116 +362,110 @@ impl MlsGroup {
         match staged_commit.state {
             StagedCommitState::PublicState(staged_state) => {
 
-                let now = ThreadTime::now();
+                {
+                    track_cpu!("merge");
+                    self.public_group
+                        .merge_diff(staged_state.into_staged_diff());
+                }
 
-                self.public_group
-                    .merge_diff(staged_state.into_staged_diff());
-                let merge_time = now.elapsed().as_micros();
-
-                let now = ThreadTime::now();
-                self.store(provider.storage())
-                    .map_err(MergeCommitError::StorageError)?;
-                let storage_time = now.elapsed().as_micros();
-
-                let merge_time = MergeTime {
-                    total: 0,
-                    merge: merge_time,
-                    storage: storage_time,
-                };
-
-                Ok(merge_time)
-            }
-            StagedCommitState::GroupMember(state) => {
-                // Save the past epoch
-                let now = ThreadTime::now();
-
-                let past_epoch = self.context().epoch();
-                // Get all the full leaves
-                let leaves = self.public_group().members().collect();
-                // Merge the staged commit into the group state and store the secret tree from the
-                // previous epoch in the message secrets store.
-                self.group_epoch_secrets = state.group_epoch_secrets;
-
-                // Replace the previous message secrets with the new ones and return the previous message secrets
-                let mut message_secrets = state.message_secrets;
-                mem::swap(
-                    &mut message_secrets,
-                    self.message_secrets_store.message_secrets_mut(),
-                );
-                self.message_secrets_store
-                    .add(past_epoch, message_secrets, leaves);
-
-                let storage_time = now.elapsed().as_micros();
-
-                let now = ThreadTime::now();
-                self.public_group.merge_diff(state.staged_diff);
-                // TODO #1194: Group storage and key storage should be
-                // correlated s.t. there is no divergence between key material
-                // and group state.
-
-                let leaf_keypair = if let Some(keypair) = &state.new_leaf_keypair_option {
-                    vec![keypair.clone()]
-                } else {
-                    vec![]
-                };
-
-                let merge_time = now.elapsed().as_micros();
-                
-                let now = ThreadTime::now();
-                // Figure out which keys we need in the new epoch.
-                let new_owned_encryption_keys = self
-                    .public_group()
-                    .owned_encryption_keys(self.own_leaf_index());
-                // From the old and new keys, keep the ones that are still relevant in the new epoch.
-                let epoch_keypairs: Vec<EncryptionKeyPair> = old_epoch_keypairs
-                    .into_iter()
-                    .chain(state.new_keypairs)
-                    .chain(leaf_keypair)
-                    .filter(|keypair| new_owned_encryption_keys.contains(keypair.public_key()))
-                    .collect();
-                
-                // Store the updated group state
-                let storage = provider.storage();
-                let group_id = self.group_id();
-
-                self.public_group
-                    .store(storage)
-                    .map_err(MergeCommitError::StorageError)?;
-
-                storage
-                    .write_group_epoch_secrets(group_id, &self.group_epoch_secrets)
-                    .map_err(MergeCommitError::StorageError)?;
-
-                storage
-                    .write_message_secrets(group_id, &self.message_secrets_store)
-                    .map_err(MergeCommitError::StorageError)?;
-
-                // Store the relevant keys under the new epoch
-                self.store_epoch_keypairs(storage, epoch_keypairs.as_slice())
-                    .map_err(MergeCommitError::StorageError)?;
-
-                // Delete the old keys.
-                self.delete_previous_epoch_keypairs(storage)
-                    .map_err(MergeCommitError::StorageError)?;
-                if let Some(keypair) = state.new_leaf_keypair_option {
-                    keypair
-                        .delete(storage)
+                {
+                    track_cpu!("merge_storage");
+                    self.store(provider.storage())
                         .map_err(MergeCommitError::StorageError)?;
                 }
 
-                // Empty the proposal store
-                storage
-                    .clear_proposal_queue::<GroupId, ProposalRef>(group_id)
-                    .map_err(MergeCommitError::StorageError)?;
-                self.proposal_store_mut().empty();
+                Ok(())
+            }
+            StagedCommitState::GroupMember(state) => {
+                // Save the past epoch
+                {
+                    track_cpu!("merge_storage");
+                    let past_epoch = self.context().epoch();
+                    // Get all the full leaves
+                    let leaves = self.public_group().members().collect();
+                    // Merge the staged commit into the group state and store the secret tree from the
+                    // previous epoch in the message secrets store.
+                    self.group_epoch_secrets = state.group_epoch_secrets;
 
-                let storage_time = storage_time + now.elapsed().as_micros();
+                    // Replace the previous message secrets with the new ones and return the previous message secrets
+                    let mut message_secrets = state.message_secrets;
+                    mem::swap(
+                        &mut message_secrets,
+                        self.message_secrets_store.message_secrets_mut(),
+                    );
+                    self.message_secrets_store
+                        .add(past_epoch, message_secrets, leaves);
 
-                Ok(MergeTime {
-                    total: 0,
-                    merge: merge_time,
-                    storage: storage_time,
-                })
+                }
+
+                let leaf_keypair = {
+                    track_cpu!("merge");
+                
+                    self.public_group.merge_diff(state.staged_diff);
+                    // TODO #1194: Group storage and key storage should be
+                    // correlated s.t. there is no divergence between key material
+                    // and group state.
+
+                    if let Some(keypair) = &state.new_leaf_keypair_option {
+                        vec![keypair.clone()]
+                    } else {
+                        vec![]
+                    }
+                };
+
+                
+                {
+                    track_cpu!("merge_storage");
+                    // Figure out which keys we need in the new epoch.
+                    let new_owned_encryption_keys = self
+                        .public_group()
+                        .owned_encryption_keys(self.own_leaf_index());
+                    // From the old and new keys, keep the ones that are still relevant in the new epoch.
+                    let epoch_keypairs: Vec<EncryptionKeyPair> = old_epoch_keypairs
+                        .into_iter()
+                        .chain(state.new_keypairs)
+                        .chain(leaf_keypair)
+                        .filter(|keypair| new_owned_encryption_keys.contains(keypair.public_key()))
+                        .collect();
+                    
+                    // Store the updated group state
+                    let storage = provider.storage();
+                    let group_id = self.group_id();
+
+                    self.public_group
+                        .store(storage)
+                        .map_err(MergeCommitError::StorageError)?;
+
+                    storage
+                        .write_group_epoch_secrets(group_id, &self.group_epoch_secrets)
+                        .map_err(MergeCommitError::StorageError)?;
+
+                    storage
+                        .write_message_secrets(group_id, &self.message_secrets_store)
+                        .map_err(MergeCommitError::StorageError)?;
+
+                    // Store the relevant keys under the new epoch
+                    self.store_epoch_keypairs(storage, epoch_keypairs.as_slice())
+                        .map_err(MergeCommitError::StorageError)?;
+
+                    // Delete the old keys.
+                    self.delete_previous_epoch_keypairs(storage)
+                        .map_err(MergeCommitError::StorageError)?;
+                    if let Some(keypair) = state.new_leaf_keypair_option {
+                        keypair
+                            .delete(storage)
+                            .map_err(MergeCommitError::StorageError)?;
+                    }
+
+                    // Empty the proposal store
+                    storage
+                        .clear_proposal_queue::<GroupId, ProposalRef>(group_id)
+                        .map_err(MergeCommitError::StorageError)?;
+                    self.proposal_store_mut().empty();
+
+                }
+
+                Ok(())
             }
         }
 

@@ -20,11 +20,11 @@
 use std::collections::HashSet;
 
 use log::debug;
+use mls_profiling::track_cpu;
 use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::random::OpenMlsRand;
 use openmls_traits::{signatures::Signer, types::Ciphersuite};
 use serde::{Deserialize, Serialize};
-use cpu_time::ThreadTime;
 
 use super::node::leaf_node::UpdateLeafNodeParams;
 use super::{
@@ -69,6 +69,8 @@ pub(crate) struct StagedTreeSyncDiff {
     diff: StagedMlsBinaryTreeDiff<TreeSyncLeafNode, TreeSyncParentNode>,
     new_tree_hash: Vec<u8>,
     new_tree_hashes: Vec<Vec<u8>>,
+    blanked_leaves: Vec<LeafNodeIndex>,
+    num_members: usize,
 }
 
 impl StagedTreeSyncDiff {
@@ -78,8 +80,10 @@ impl StagedTreeSyncDiff {
         StagedMlsBinaryTreeDiff<TreeSyncLeafNode, TreeSyncParentNode>,
         Vec<u8>,
         Vec<Vec<u8>>,
+        Vec<LeafNodeIndex>,
+        usize
     ) {
-        (self.diff, self.new_tree_hash, self.new_tree_hashes)
+        (self.diff, self.new_tree_hash, self.new_tree_hashes, self.blanked_leaves, self.num_members)
     }
 }
 
@@ -92,6 +96,8 @@ impl StagedTreeSyncDiff {
 pub(crate) struct TreeSyncDiff<'a> {
     diff: MlsBinaryTreeDiff<'a, TreeSyncLeafNode, TreeSyncParentNode>,
     pub(crate) tree_hashes: Vec<Vec<u8>>,
+    pub(crate) blanked_leaves: Vec<LeafNodeIndex>,
+    pub(crate) num_members: usize,
 }
 
 impl<'a> From<&'a TreeSync> for TreeSyncDiff<'a> {
@@ -99,6 +105,8 @@ impl<'a> From<&'a TreeSync> for TreeSyncDiff<'a> {
         TreeSyncDiff {
             diff: tree_sync.tree.empty_diff(),
             tree_hashes: tree_sync.tree_hashes.clone(),
+            blanked_leaves: tree_sync.blanked_leaves.clone(),
+            num_members: tree_sync.num_members(),
         }
     }
 }
@@ -175,12 +183,13 @@ impl TreeSyncDiff<'_> {
 
     /// Returns the index of the last full leaf in the tree.
     fn rightmost_full_leaf(&self) -> LeafNodeIndex {
-        let mut index = LeafNodeIndex::new(0);
-        for (leaf_index, leaf) in self.diff.leaves() {
+        let index = LeafNodeIndex::new((self.num_members + self.blanked_leaves.len() - 1) as u32);
+        /*for (leaf_index, leaf) in self.diff.leaves_rev() {
             if leaf.node().as_ref().is_some() {
-                index = leaf_index;
+                println!("Found full leaf at index {:?}. Estimated: {:?}. Num_Members: {}, Blanked leaves: {}", leaf_index, index, self.num_members, self.blanked_leaves.len());
+                return leaf_index;
             }
-        }
+        }*/
         index
     }
 
@@ -209,17 +218,29 @@ impl TreeSyncDiff<'_> {
     /// Find and return the index of either the left-most blank leaf, or, if
     /// there are no blank leaves, the leaf count.
     pub(crate) fn free_leaf_index(&self) -> LeafNodeIndex {
+
+        let index = if !self.blanked_leaves.is_empty() {
+            // Find minimum blank leaf index
+            *self.blanked_leaves.iter().min().unwrap()
+        }
+        else {
+            // If there are no blank leaves, we return the number of users, which is the index of the next free leaf.
+            LeafNodeIndex::new(self.num_members as u32)
+        };
+
+
+        
+        /* // Search for blank leaves in existing leaves
         let mut leaf_count = 0;
-        // Search for blank leaves in existing leaves
         for (leaf_index, leaf_id) in self.diff.leaves() {
             if leaf_id.node().is_none() {
+                //println!("Found blank leaf at index {:?}. Estimated: {:?}. Num_Members: {}, Blanked leaves: {}", leaf_index, index, self.num_members, self.blanked_leaves.len());
                 return leaf_index;
             }
             leaf_count += 1;
-        }
+        }*/
 
-        // Return the next free virtual blank leaf
-        LeafNodeIndex::new(leaf_count)
+        index
     }
 
     /// Adds a new leaf to the tree either by filling a blank leaf or by
@@ -255,6 +276,10 @@ impl TreeSyncDiff<'_> {
                 parent_node.add_unmerged_leaf(leaf_index);
             }
         }
+
+        // If the new leaf was previously blank, we need to remove it from the list of blanked leaves in the diff
+        self.blanked_leaves.retain(|&index| index != leaf_index);
+        self.num_members += 1;
         Ok(leaf_index)
     }
 
@@ -271,6 +296,10 @@ impl TreeSyncDiff<'_> {
         self.diff
             .set_direct_path_to_node(leaf_index, &TreeSyncParentNode::blank());
         self.trim_tree();
+
+        // We add the blanked leaf to the list of blanked leaves in the diff
+        self.blanked_leaves.push(leaf_index);
+        self.num_members -= 1;
     }
 
     /// Derive a new direct path for the leaf with the given index.
@@ -314,20 +343,25 @@ impl TreeSyncDiff<'_> {
 
         let parent_hash = self.process_update_path(crypto, ciphersuite, leaf_index, path)?;
 
-        // We generate the new leaf with all parameters
-        let (leaf_node, node_keypair) = LeafNode::new_with_parent_hash(
-            rand,
-            crypto,
-            ciphersuite,
-            &parent_hash,
-            leaf_node_params,
-            group_id,
-            leaf_index,
-            signer,
-        )?;
-        
-        self.update_tree_hashes(crypto, ciphersuite, vec![(leaf_index, &leaf_node.clone().into())])?;
+         let (leaf_node, node_keypair) = {
+            track_cpu!("sign");
+            // We generate the new leaf with all parameters
+            LeafNode::new_with_parent_hash(
+                rand,
+                crypto,
+                ciphersuite,
+                &parent_hash,
+                leaf_node_params,
+                group_id,
+                leaf_index,
+                signer,
+            )?
+        };
 
+        {
+            track_cpu!("tree_hash");
+            self.update_tree_hashes(crypto, ciphersuite, vec![(leaf_index, &leaf_node.clone().into())])?;
+        }
         // We insert the fresh leaf into the tree.
         self.diff.replace_leaf(leaf_index, leaf_node.into());
 
@@ -351,55 +385,65 @@ impl TreeSyncDiff<'_> {
         sender_leaf_index: LeafNodeIndex,
         update_path: &UpdatePath,
     ) -> Result<(), ApplyUpdatePathError> {
-        let path = update_path.nodes();
+        let path = {
+            track_cpu!("tree");
+            let path = update_path.nodes();
 
-        // If the committer is a `NewMemberCommit`, we have to add the
-        // leaf to the tree before we can apply an update path. This is
-        // s.t. the tree can be grown if necessary.
-        if self.diff.leaf(sender_leaf_index).node().is_none()
-            || sender_leaf_index.u32() >= self.leaf_count()
-        {
-            let new_leaf_index =
-                self.add_leaf(update_path.leaf_node().clone())
-                    .map_err(|e| match e {
-                        TreeSyncAddLeaf::LibraryError(e) => ApplyUpdatePathError::LibraryError(e),
-                        TreeSyncAddLeaf::TreeFull => ApplyUpdatePathError::TreeFull,
-                    })?;
-            // The new member should have the same index as the claimed sender index.
-            if sender_leaf_index != new_leaf_index {
-                return Err(ApplyUpdatePathError::InconsistentSenderIndex);
+            // If the committer is a `NewMemberCommit`, we have to add the
+            // leaf to the tree before we can apply an update path. This is
+            // s.t. the tree can be grown if necessary.
+            if self.diff.leaf(sender_leaf_index).node().is_none()
+                || sender_leaf_index.u32() >= self.leaf_count()
+            {
+                let new_leaf_index =
+                    self.add_leaf(update_path.leaf_node().clone())
+                        .map_err(|e| match e {
+                            TreeSyncAddLeaf::LibraryError(e) => ApplyUpdatePathError::LibraryError(e),
+                            TreeSyncAddLeaf::TreeFull => ApplyUpdatePathError::TreeFull,
+                        })?;
+                // The new member should have the same index as the claimed sender index.
+                if sender_leaf_index != new_leaf_index {
+                    return Err(ApplyUpdatePathError::InconsistentSenderIndex);
+                }
             }
+
+            // ValSem202: Path must be the right length
+            // https://validation.openmls.tech/#valn1101
+            let filtered_direct_path = self.filtered_direct_path(sender_leaf_index);
+            if filtered_direct_path.len() != path.len() {
+                return Err(ApplyUpdatePathError::PathLengthMismatch);
+            };
+
+            let path = filtered_direct_path
+                .into_iter()
+                .zip(
+                    path.iter()
+                        .map(|update_path_node| update_path_node.public_key.clone().into()),
+                )
+                .collect();
+
+            path
+        };
+
+        {
+            track_cpu!("parent_hash");
+            // Verify the parent hash.
+            let parent_hash = self.process_update_path(crypto, ciphersuite, sender_leaf_index, path)?;
+            let leaf_node_parent_hash = update_path
+                .leaf_node()
+                .parent_hash()
+                .ok_or(ApplyUpdatePathError::MissingParentHash)?;
+            if leaf_node_parent_hash != parent_hash {
+                return Err(ApplyUpdatePathError::ParentHashMismatch);
+            };
         }
-
-        // ValSem202: Path must be the right length
-        // https://validation.openmls.tech/#valn1101
-        let filtered_direct_path = self.filtered_direct_path(sender_leaf_index);
-        if filtered_direct_path.len() != path.len() {
-            return Err(ApplyUpdatePathError::PathLengthMismatch);
-        };
-
-        let path = filtered_direct_path
-            .into_iter()
-            .zip(
-                path.iter()
-                    .map(|update_path_node| update_path_node.public_key.clone().into()),
-            )
-            .collect();
-
-        // Verify the parent hash.
-        let parent_hash = self.process_update_path(crypto, ciphersuite, sender_leaf_index, path)?;
-        let leaf_node_parent_hash = update_path
-            .leaf_node()
-            .parent_hash()
-            .ok_or(ApplyUpdatePathError::MissingParentHash)?;
-        if leaf_node_parent_hash != parent_hash {
-            return Err(ApplyUpdatePathError::ParentHashMismatch);
-        };
 
         // Update the `encryption_key` in the leaf.
         let leaf: LeafNode = update_path.leaf_node().clone();
-        self.update_tree_hashes(crypto, ciphersuite, vec![(sender_leaf_index, &leaf.clone().into())])?;
-
+        {
+            track_cpu!("tree_hash");
+            self.update_tree_hashes(crypto, ciphersuite, vec![(sender_leaf_index, &leaf.clone().into())])?;
+        }
         self.diff.replace_leaf(sender_leaf_index, leaf.into());
         Ok(())
     }
@@ -418,9 +462,14 @@ impl TreeSyncDiff<'_> {
         leaf_index: LeafNodeIndex,
         mut path: Vec<(ParentNodeIndex, ParentNode)>,
     ) -> Result<Vec<u8>, LibraryError> {
-        // Compute the parent hash.
-        let parent_hash = self.set_parent_hashes(crypto, ciphersuite, &mut path, leaf_index)?;
 
+        let parent_hash = {
+            track_cpu!("parent_hash");
+            // Compute the parent hash.
+            self.set_parent_hashes(crypto, ciphersuite, &mut path, leaf_index)?
+        };
+
+        track_cpu!("tree");
         // While probably not necessary, the spec mandates we blank the direct path nodes
         let direct_path_nodes = self.diff.direct_path(leaf_index);
         for node in direct_path_nodes {
@@ -607,10 +656,17 @@ impl TreeSyncDiff<'_> {
         }
 
         let mut copath_resolutions = Vec::new();
-        for node_index in self.diff.copath(leaf_index) {
-            let rightmost_full_leaf = self.rightmost_full_leaf();
 
-            let resolution = self.resolution(node_index, &HashSet::new(), &rightmost_full_leaf);
+        for node_index in self.diff.copath(leaf_index) {
+            let rightmost_full_leaf = {
+                self.rightmost_full_leaf()
+            };
+
+            let resolution = {
+                track_cpu!("resolution");
+                self.resolution(node_index, &HashSet::new(), &rightmost_full_leaf)
+            };
+
             if !resolution.is_empty() {
                 let filtered_resolution = resolution
                     .into_iter()
@@ -744,6 +800,8 @@ impl TreeSyncDiff<'_> {
             diff: self.diff.into(),
             new_tree_hash,
             new_tree_hashes: self.tree_hashes,
+            blanked_leaves: self.blanked_leaves,
+            num_members: self.num_members,
         })
     }
 
@@ -947,14 +1005,16 @@ impl TreeSyncDiff<'_> {
             .subtree_root_copath_node(sender_leaf_index, leaf_index);
 
             let rightmost_full_leaf = self.rightmost_full_leaf();
-        let sender_copath_resolution: Vec<EncryptionKey> = self
-            .resolution(subtree_root_copath_node_id, excluded_indices, &rightmost_full_leaf)
-            .into_iter()
-            .map(|(_, node_ref)| match node_ref {
-                NodeReference::Leaf(leaf) => leaf.encryption_key().clone(),
-                NodeReference::Parent(parent) => parent.encryption_key().clone(),
-            })
-            .collect();
+        
+        let sender_copath_resolution: Vec<EncryptionKey> =
+                self
+                .resolution(subtree_root_copath_node_id, excluded_indices, &rightmost_full_leaf)
+                .into_iter()
+                .map(|(_, node_ref)| match node_ref {
+                    NodeReference::Leaf(leaf) => leaf.encryption_key().clone(),
+                    NodeReference::Parent(parent) => parent.encryption_key().clone(),
+                })
+                .collect();
 
         if let Some((keypair, resolution_position)) = sender_copath_resolution
             .iter()
@@ -973,6 +1033,13 @@ impl TreeSyncDiff<'_> {
             return Ok((keypair.private_key(), resolution_position));
         };
         Err(TreeSyncDiffError::NoPrivateKeyFound)
+    }
+
+    /// Returns an iterator over the (non-blank) [`LeafNode`]s in the tree.
+    pub(crate) fn full_leaves(&self) -> impl Iterator<Item = &LeafNode> {
+        self.diff
+            .leaves()
+            .filter_map(|(_, tsn)| tsn.node().as_ref())
     }
 
     /// Returns a vector of all nodes in the tree resulting from merging this

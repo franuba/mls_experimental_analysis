@@ -5,12 +5,12 @@ from sklearn.metrics import r2_score
 import numpy as np
 
 plt.rcParams.update({
-    "font.size": 14,
-    "axes.titlesize": 16,
-    "axes.labelsize": 14,
-    "legend.fontsize": 13,
-    "xtick.labelsize": 12,
-    "ytick.labelsize": 12,
+    "font.size": 18,
+    "axes.titlesize": 20,
+    "axes.labelsize": 18,
+    "legend.fontsize": 18,
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
 })
 
 x_label = "num_users"
@@ -39,18 +39,18 @@ def group_and_average(df):
     df = df.sort_values(by=x_label)  
     df[x_label] = (df[x_label] // 100) * 100
     return df.groupby(['group', x_label]).agg({
-        'gen_elapsed_mean': 'mean',
-        'processing_elapsed_mean': 'mean',
-        'sizes_mean': 'mean',
+        'gen_elapsed_mean': ['mean', 'std'],
+        'processing_elapsed_mean': ['mean', 'std'],
+        'sizes_mean': ['mean', 'std'],
     }).reset_index()
 
 folder_path = "data"
 
 operations = ['gen_elapsed_mean', "processing_elapsed_mean", "sizes_mean"]
-y_labels = ['Generation time (milliseconds)', 'Processing time (milliseconds)', 'Size per update (KB)']
+y_labels = ['Generation time (ms)', 'Processing time (ms)', 'Size (KB)']
 
 line_names = ["Commit", "2 Prop", "4 Prop", "8 Prop"]
-files = ['commit.csv', 'prop_2.csv', "prop_4_2.csv", "prop_8.csv"]
+files = ['commit.csv', 'prop_2.csv', "prop_4.csv", "prop_8.csv"]
 
 #line_names = ["First", "Last", "Commit"]
 #files = ["first.csv", "test_10000_opt_LAST.csv", "commit.csv"]
@@ -69,22 +69,28 @@ for operation, y_label in zip(operations, y_labels):
         data = data[data[x_label] < size_limit]
         data = data[data[x_label] > 100]
 
+        data_mean = data[operation]['mean']
+        data_std = data[operation]['std']
+
         data[x_label] = pd.to_numeric(data[x_label], errors='coerce')
-        data[operation] = pd.to_numeric(data[operation], errors='coerce')
+        data_mean = pd.to_numeric(data_mean, errors='coerce')
         data[x_label] = data[x_label].fillna(0).astype(int)
 
-        data[operation] = data[operation] / 1000  # Convert to milliseconds if time, or to KB if size
+        data_mean = data_mean / 1000  # Convert to milliseconds if time, or to KB if size
+        data_std = data_std / 1000 
 
-        #compare_r2_score(data[x_label].values, data[operation].sort_values)
+        #compare_r2_score(data[x_label].values, data_mean.sort_values)
 
-        operation_lines.append(data[operation])
-        plt.plot(data[x_label], data[operation], label=line_names[i], marker='.')
+        operation_lines.append(data_mean)
+        plt.plot(data[x_label], data_mean, label=line_names[i], marker='o',markersize=4, linewidth=2)
+        plt.fill_between(data[x_label], data_mean - data_std, data_mean + data_std, alpha=0.2)
 
     plt.xlabel('Users')
     plt.ylabel(y_label)
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
+    operation = operation.replace("_mean", "")
     plt.savefig("figures/" + operation + ".pdf")
     plt.show()
 
