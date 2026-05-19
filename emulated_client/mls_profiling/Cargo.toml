@@ -1,0 +1,8 @@
+[package]
+name = "mls_profiling"
+version = "0.1.0"
+authors = ["David Soler"]
+edition = "2021"
+
+[dependencies]
+cpu-time = "1.0.0"

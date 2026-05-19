@@ -33,8 +33,7 @@ impl MlsGroup {
     ///
     /// [`Welcome`]: crate::messages::Welcome
     // FIXME: #1217
-    #[allow(clippy::type_complexity)]
-    pub fn add_members<Provider: OpenMlsProvider>(
+pub fn add_members<Provider: OpenMlsProvider>(
         &mut self,
         provider: &Provider,
         signer: &impl Signer,
@@ -43,7 +42,29 @@ impl MlsGroup {
         (MlsMessageOut, MlsMessageOut, Option<GroupInfo>),
         AddMembersError<Provider::StorageError>,
     > {
-        self.add_members_internal(provider, signer, key_packages, true)
+        self.is_operational()?;
+
+        if key_packages.is_empty() {
+            return Err(AddMembersError::EmptyInput(EmptyInputError::AddMembers));
+        }
+
+        let builder = self
+            .commit_builder()
+            .propose_adds(key_packages.iter().cloned())
+            .force_self_update(true)
+            .load_psks(provider.storage())?
+            .build(provider.rand(), provider.crypto(), signer, |_| true)?;
+
+        let bundle = builder.stage_commit(provider)?;
+
+        let welcome: MlsMessageOut = bundle.to_welcome_msg().ok_or(LibraryError::custom(
+            "No secrets to generate commit message.",
+        ))?;
+        let (commit, _, group_info) = bundle.into_contents();
+
+        self.reset_aad();
+
+        Ok((commit, welcome, group_info))
     }
 
     /// Adds members to the group.
@@ -112,44 +133,6 @@ impl MlsGroup {
         self.reset_aad();
 
         Ok((commit, welcome, group_info))
-    }
-
-    pub fn add_members_deep<Provider: OpenMlsProvider>(
-        &mut self,
-        provider: &Provider,
-        signer: &impl Signer,
-        key_packages: &[KeyPackage],
-    ) -> Result<
-        (MlsMessageOut, MlsMessageOut, Option<GroupInfo>, CryptoTime),
-        AddMembersError<Provider::StorageError>,
-    > {
-        self.is_operational()?;
-
-        if key_packages.is_empty() {
-            return Err(AddMembersError::EmptyInput(EmptyInputError::AddMembers));
-        }
-
-        let (builder, mut time) = self
-            .commit_builder()
-            .propose_adds(key_packages.iter().cloned())
-            .force_self_update(true)
-            .load_psks(provider.storage())?
-            .build_deep(provider.rand(), provider.crypto(), signer, |_| true)?;
-
-        let (bundle, storage_time, encryption_time) = builder.stage_commit_deep(provider)?;
-        time.storage = storage_time;
-        time.encrypt = encryption_time;
-
-        time.total = time.total + storage_time + encryption_time;
-
-        let welcome: MlsMessageOut = bundle.to_welcome_msg().ok_or(LibraryError::custom(
-            "No secrets to generate commit message.",
-        ))?;
-        let (commit, _, group_info) = bundle.into_contents();
-
-        self.reset_aad();
-
-        Ok((commit, welcome, group_info, time))
     }
 
     /// Returns a reference to the own [`LeafNode`].

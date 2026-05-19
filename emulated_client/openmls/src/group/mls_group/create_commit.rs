@@ -194,7 +194,7 @@ impl MlsGroup {
         let apply_proposals_values =
             diff.apply_proposals(&proposal_queue, self.own_leaf_index())?;
 
-        let (path_computation_result, _, _) =
+        let path_computation_result =
             // If path is needed, compute path values
             if apply_proposals_values.path_required
                 || contains_own_updates
@@ -218,7 +218,7 @@ impl MlsGroup {
                 // If path is not needed, update the group context and return
                 // empty path processing results
                 diff.update_group_context(apply_proposals_values.extensions.clone())?;
-                (PathComputationResult::default(), 0, 0)
+                PathComputationResult::default()
             };
 
         let path_result = path_computation_result.clone();

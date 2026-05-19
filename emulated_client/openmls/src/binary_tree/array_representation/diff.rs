@@ -24,6 +24,7 @@ use crate::error::LibraryError;
 
 use super::{
     sorted_iter::sorted_iter,
+    reversed_sorted_iter::reversed_sorted_iter,
     tree::{ABinaryTree, ABinaryTreeError},
     treemath::{
         copath, direct_path, left, leftmost, lowest_common_ancestor, right, root, LeafNodeIndex,
@@ -178,6 +179,28 @@ impl<L: Clone + Debug + Default, P: Clone + Debug + Default> AbDiff<'_, L, P> {
         let cmp = |&(x, _): &(LeafNodeIndex, &L)| x;
 
         sorted_iter(a_iter, b_iter, cmp, self.leaf_count() as usize)
+    }
+
+    /// Returns an iterator over a tuple of the leaf index and a reference to a
+    /// leaf, sorted according to their position in the tree from left to right.
+    pub(crate) fn leaves_rev(&self) -> impl Iterator<Item = (LeafNodeIndex, &L)> {
+        
+        let original_leaves = self.original_tree.leaves_rev().peekable();
+        let diff_leaves = self
+            .leaf_diff
+            .iter()
+            .map(|(index, leaf)| (*index, leaf))
+            .rev()
+            .peekable();
+
+        // Harmonize the iterator types
+        let a_iter = Box::new(diff_leaves) as Box<dyn Iterator<Item = (LeafNodeIndex, &L)>>;
+        let b_iter = Box::new(original_leaves) as Box<dyn Iterator<Item = (LeafNodeIndex, &L)>>;
+
+        // We only compare indices, not the actual leaves
+        let cmp = |&(x, _): &(LeafNodeIndex, &L)| x;
+
+        reversed_sorted_iter(a_iter, b_iter, cmp, self.leaf_count() as usize)
     }
 
     pub(crate) fn diff_leaves(&self) -> impl Iterator<Item = (LeafNodeIndex, &L)> {

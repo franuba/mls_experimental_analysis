@@ -36,7 +36,7 @@ pub enum CGKAAction {
     // User who committed
     Welcome(String, usize),
     // message size, time taken (crypto), time taken (export), time taken (merge)
-    DeepCommit(usize, CryptoTime, u128, MergeTime),
+    DeepCommit(usize, CryptoTime, MergeTime),
     // time taken (crypto), time taken (merge)
     DeepProcess(String, ProcessCryptoTime, MergeTime),
     Create,
@@ -77,18 +77,22 @@ impl Display for CGKAAction {
             }
             CGKAAction::Create => {write!(f, "Create")}
             CGKAAction::CommitAttempt(action) => {write!(f, "CommitAttempt {}", action)},
-            CGKAAction::DeepCommit(size, crypto, export, merge) => {
+            CGKAAction::DeepCommit(size, crypto, merge) => {
                 let CryptoTime {
                     total,
                     validation,
                     apply_proposals, 
                     tree,
+                    path,
+                    tree_hash,
+                    parent_hash,
                     encrypt_path, 
                     sign,
                     schedule,
                     welcome,
                     storage,
-                    encrypt
+                    encrypt,
+                    export
                 } = crypto;
                 let MergeTime {
                     total: total_merge,
@@ -96,7 +100,7 @@ impl Display for CGKAAction {
                     storage: storage_merge
                 } = merge;
 
-                write!(f, "DeepCommit {size} || {total} {validation} {apply_proposals} {tree} {encrypt_path} {sign} {schedule} {welcome} || {storage} {encrypt} || {export} || {total_merge} {merge} {storage_merge}" )
+                write!(f, "DeepCommit {size} || {total} {validation} {apply_proposals} {tree} {path} {tree_hash} {parent_hash} {encrypt_path} {sign} {schedule} {welcome} || {storage} {encrypt} || {export} || {total_merge} {merge} {storage_merge}" )
             },
             CGKAAction::DeepProcess(user, crypto, merge) => {
                 let ProcessCryptoTime {
@@ -106,6 +110,9 @@ impl Display for CGKAAction {
                     validation,
                     apply_proposals, 
                     tree,
+                    path,
+                    tree_hash,
+                    parent_hash,
                     schedule,
                     decrypt_path
                 } = crypto;
@@ -116,7 +123,7 @@ impl Display for CGKAAction {
                     storage: storage_merge
                 } = merge;
 
-                write!(f, "DeepProcess {user} || {total} {decrypt} {verify} {validation} {apply_proposals} {tree} {decrypt_path} {schedule} || {total_merge} {merge} {storage_merge}" )
+                write!(f, "DeepProcess {user} || {total} {decrypt} {verify} {validation} {apply_proposals} {tree} {path} {tree_hash} {parent_hash} {decrypt_path} {schedule} || {total_merge} {merge} {storage_merge}" )
             }
         }
     }

@@ -1,3 +1,4 @@
+use mls_profiling::track_cpu;
 use openmls_traits::{crypto::OpenMlsCrypto, random::OpenMlsRand, types::Ciphersuite};
 use std::io::Write;
 use tls_codec::{Serialize, Size, TlsSerialize, TlsSize};
@@ -168,12 +169,17 @@ impl PrivateMessage {
         let private_message_content_aad_bytes = private_message_content_aad
             .tls_serialize_detached()
             .map_err(LibraryError::missing_bound_check)?;
-        // Extract generation and key material for encryption
-        let secret_type = SecretType::from(&public_message.content().content_type());
-        let (generation, (ratchet_key, ratchet_nonce)) = message_secrets
-            .secret_tree_mut()
-            // Even in tests we want to use the real sender index, so we have a key to encrypt.
-            .secret_for_encryption(ciphersuite, crypto, sender_index, secret_type)?;
+
+        let (generation, (ratchet_key, ratchet_nonce)) = {
+            track_cpu!("tree");
+            // Extract generation and key material for encryption
+            let secret_type = SecretType::from(&public_message.content().content_type());
+            message_secrets
+                .secret_tree_mut()
+                // Even in tests we want to use the real sender index, so we have a key to encrypt.
+                .secret_for_encryption(ciphersuite, crypto, sender_index, secret_type)?
+        };
+
         // Sample reuse guard uniformly at random.
         let reuse_guard: ReuseGuard =
             ReuseGuard::try_from_random(rand).map_err(LibraryError::unexpected_crypto_error)?;
@@ -185,63 +191,68 @@ impl PrivateMessage {
             "Encryption key for private message: {ratchet_key:x?}"
         );
         log_crypto!(trace, "Encryption of private message private_message_content_aad_bytes: {private_message_content_aad_bytes:x?} - ratchet_nonce: {prepared_nonce:x?}");
-        let ciphertext = ratchet_key
-            .aead_seal(
-                crypto,
-                &Self::encode_padded_ciphertext_content_detached(
-                    public_message,
-                    padding_size,
-                    ciphersuite.mac_length(),
-                )
-                .map_err(LibraryError::missing_bound_check)?,
-                &private_message_content_aad_bytes,
-                &prepared_nonce,
-            )
-            .map_err(LibraryError::unexpected_crypto_error)?;
-        log::trace!("Encrypted ciphertext {:x?}", ciphertext);
-        // Derive the sender data key from the key schedule using the ciphertext.
-        let sender_data_key = message_secrets
-            .sender_data_secret()
-            .derive_aead_key(crypto, ciphersuite, &ciphertext)
-            .map_err(LibraryError::unexpected_crypto_error)?;
-        // Derive initial nonce from the key schedule using the ciphertext.
-        let sender_data_nonce = message_secrets
-            .sender_data_secret()
-            .derive_aead_nonce(ciphersuite, crypto, &ciphertext)
-            .map_err(LibraryError::unexpected_crypto_error)?;
-        // Compute sender data nonce by xoring reuse guard and key schedule
-        // nonce as per spec.
-        let mls_sender_data_aad = MlsSenderDataAad::new(
-            header.group_id.clone(),
-            header.epoch,
-            public_message.content().content_type(),
-        );
-        // Serialize the sender data AAD
-        let mls_sender_data_aad_bytes = mls_sender_data_aad
-            .tls_serialize_detached()
-            .map_err(LibraryError::missing_bound_check)?;
-        let sender_data = MlsSenderData::from_sender(
-            // XXX: #106 This will fail for messages with a non-member sender.
-            header.sender,
-            generation,
-            reuse_guard,
-        );
-        // Encrypt the sender data
-        log_crypto!(
-            trace,
-            "Encryption key for sender data: {sender_data_key:x?}"
-        );
-        log_crypto!(trace, "Encryption of sender data mls_sender_data_aad_bytes: {mls_sender_data_aad_bytes:x?} - sender_data_nonce: {sender_data_nonce:x?}");
-        let encrypted_sender_data = sender_data_key
-            .aead_seal(
-                crypto,
-                &sender_data
-                    .tls_serialize_detached()
+        let (ciphertext, encrypted_sender_data) = {
+            track_cpu!("encrypt");
+            let ciphertext = ratchet_key
+                .aead_seal(
+                    crypto,
+                    &Self::encode_padded_ciphertext_content_detached(
+                        public_message,
+                        padding_size,
+                        ciphersuite.mac_length(),
+                    )
                     .map_err(LibraryError::missing_bound_check)?,
-                &mls_sender_data_aad_bytes,
-                &sender_data_nonce,
-            )
-            .map_err(LibraryError::unexpected_crypto_error)?;
+                    &private_message_content_aad_bytes,
+                    &prepared_nonce,
+                )
+                .map_err(LibraryError::unexpected_crypto_error)?;
+            log::trace!("Encrypted ciphertext {:x?}", ciphertext);
+            // Derive the sender data key from the key schedule using the ciphertext.
+            let sender_data_key = message_secrets
+                .sender_data_secret()
+                .derive_aead_key(crypto, ciphersuite, &ciphertext)
+                .map_err(LibraryError::unexpected_crypto_error)?;
+            // Derive initial nonce from the key schedule using the ciphertext.
+            let sender_data_nonce = message_secrets
+                .sender_data_secret()
+                .derive_aead_nonce(ciphersuite, crypto, &ciphertext)
+                .map_err(LibraryError::unexpected_crypto_error)?;
+            // Compute sender data nonce by xoring reuse guard and key schedule
+            // nonce as per spec.
+            let mls_sender_data_aad = MlsSenderDataAad::new(
+                header.group_id.clone(),
+                header.epoch,
+                public_message.content().content_type(),
+            );
+            // Serialize the sender data AAD
+            let mls_sender_data_aad_bytes = mls_sender_data_aad
+                .tls_serialize_detached()
+                .map_err(LibraryError::missing_bound_check)?;
+            let sender_data = MlsSenderData::from_sender(
+                // XXX: #106 This will fail for messages with a non-member sender.
+                header.sender,
+                generation,
+                reuse_guard,
+            );
+            // Encrypt the sender data
+            log_crypto!(
+                trace,
+                "Encryption key for sender data: {sender_data_key:x?}"
+            );
+            log_crypto!(trace, "Encryption of sender data mls_sender_data_aad_bytes: {mls_sender_data_aad_bytes:x?} - sender_data_nonce: {sender_data_nonce:x?}");
+            let encrypted_sender_data = sender_data_key
+                .aead_seal(
+                    crypto,
+                    &sender_data
+                        .tls_serialize_detached()
+                        .map_err(LibraryError::missing_bound_check)?,
+                    &mls_sender_data_aad_bytes,
+                    &sender_data_nonce,
+                )
+                .map_err(LibraryError::unexpected_crypto_error)?;
+
+                (ciphertext, encrypted_sender_data)
+        };
         Ok(PrivateMessage {
             group_id: header.group_id.clone(),
             epoch: header.epoch,

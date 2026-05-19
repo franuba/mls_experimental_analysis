@@ -134,6 +134,16 @@ impl<L: Clone + Debug + Default, P: Clone + Debug + Default> ABinaryTree<L, P> {
             .map(|(index, leave)| (LeafNodeIndex::new(index as u32), leave))
     }
 
+        /// Returns an iterator over a tuple of the leaf index and a reference to a
+    /// leaf, sorted according to their position in the tree from left to right.
+    pub(crate) fn leaves_rev(&self) -> impl Iterator<Item = (LeafNodeIndex, &L)> {
+        self.leaf_nodes
+            .iter()
+            .enumerate()
+            .map(|(index, leave)| (LeafNodeIndex::new(index as u32), leave))
+            .rev()
+    }
+
     /// Returns an iterator over a tuple of the parent index and a reference to
     /// a parent, sorted according to their position in the tree from left to
     /// right.

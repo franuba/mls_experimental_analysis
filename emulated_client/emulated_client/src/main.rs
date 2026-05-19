@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use emulated_client::provider::openmls_rust_persistent_crypto::OpenMlsRustPersistentCrypto;
-use emulated_client::provider::null_storage_provider::OpenMlsRustNullStorageCrypto;
+//use emulated_client::provider::null_storage_provider::OpenMlsRustNullStorageCrypto;
 use tracing::{Level};
 use clap::{Arg, ArgAction, Command};
 use config::Config;
